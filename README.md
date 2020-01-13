@@ -1,7 +1,7 @@
 # alldedup
 The first and so far only ZFS offline deduplication tool. Can also efficiently deduplicate Btrfs and XFS.
 
-Currently relies on [rmlint](https://github.com/sahib/rmlint), though a planned binary version will remove external dependencies.
+Currently relies partially on [rmlint](https://github.com/sahib/rmlint), though a planned binary version will remove external dependencies.
 
 Deduplicates the specified directory and below, via one of three explicit options. Duplicate files aren't deleted, but their redundant space is recovered. Includes the only known high-performance 'offline ZFS deduper' (as of 2019-Aug). All dedup methods share these common features:
 
