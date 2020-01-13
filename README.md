@@ -16,4 +16,5 @@ Deduplicates the specified directory and below, via one of three explicit option
 - Requires a recent version of rmlint, from v2.8.0 master branch, v2.9.0 release branch, or higher. v2.9.0 was released on 2019-08-20.
 
 Notes:
+
 ¹ Features provided through [rmlint](https://github.com/sahib/rmlint).
