@@ -1,0 +1,1515 @@
+#!/bin/bash
+
+#########################################################################################
+##	Purpose .....: See fPrint_About()
+##	Arguments ...: See fPrint_Syntax()
+##	Modifies:
+##		- Target filesystem (deduplicated files).
+##		- Log and script files (by default under ${HOME}/var/log).
+##	Notes:
+##		- Get latest version of rmlint (release version of 2.8.0 is old, need master branch or higher), via one of:
+##			1) Run j.build_rmlint_master if available.
+##			2) Build from source:
+##				sudo apt-get update
+##				sudo apt-get remove rmlint
+##				sudo apt-get install git scons python3-sphinx python3-nose gettext build-essential libelf-dev libglib2.0-dev libblkid-dev libjson-glib-1.0 libjson-glib-dev
+##				## GUI:
+##					sudo apt-get install python3-gi gir1.2-rsvg gir1.2-gtk-3.0 python-cairo gir1.2-polkit-1.0 gir1.2-gtksource-3.0
+##				cd "$(mktemp -d)"
+##				## Choose one of:
+##					git clone https://github.com/sahib/rmlint.git  #............ Default (Master)
+##					git clone https://github.com/sahib/rmlint.git --branch develop --single-branch develop  #... Develop
+##				cd rmlint 2>/dev/null || cd develop 2>/dev/null; cat .version
+##				scons config
+##				sudo scons --prefix=/usr install
+##				rmlint --version
+##			3) PPA:
+##				sudo apt-add-repository "ppa:e7appew/rmlint"  ## https://launchpad.net/~e7appew/+archive/ubuntu/rmlint?field.series_filter=bionic
+##				sudo apt-get update
+##				sudo apt-get install rmlint
+##				rmlint --version
+##			4) Follow instructions on: https://github.com/sahib/rmlint/releases
+##		- Dependencies:
+##			- Optional: btrfs, zfs, zpool
+##	Copyright and license:
+##		Copyright (c) 2018-2019 James Collier.
+##		License GPLv3+: GNU GPL version 3 or later, full text at:
+##		    https://www.gnu.org/licenses/gpl-3.0.en.html
+##		There is no warranty, to the extent permitted by law.
+##	History:
+##		- 20190124 JC: Created.
+##		- 20190724 JC:
+##			- Completed (or at least tidied up; not sure if this has worked before or not).
+##			- Removed two-step rmlint process, now does xattrs and finds duplicates in the same pass.
+##		- 20190826 JC:
+##			- Changed calls to 'fstrAppend_wNewline var' to 'fstrAppend var "\n"' (so the same function could be used with spaces in other new functions).
+##			- Created fThrowError() to avoid growing use of boilerplatee.
+##			- Helper commands are now written to a script, rather than one looooong command which is hard to build (esp with multiple levels of quote and $ escaping), and debug.
+##			- Made more modular with:
+##				fBuildStr_Options()
+##				fPrint_Syntax
+##				fPrint_Copyright
+##				fPrint_Info()
+##				fCreateScript_ShowRealtimeStatus()
+##				fCreateScript_ShowPotentiallyHarmfulCommands()
+##				fCreateFile_Help()
+##			- Added a few helper functions from 0_library_v2.
+##			- Redirect error output of rmlint to log file.
+##		- 20190826 JC:
+##			- Made generic. Handles clone, hardlink, and zfs 'recopy'.
+##		- 20190903 JC:
+##			- Finished and thoroughly tested all functionality.
+##			- Need to finish some unusual edge cases in TODO, but currently nothing is known to actually cause data loss.
+##			- Filed to issues with rmlint that prevent this from really being idiot & bulletproof:
+##				- More than one run with handler=hardlink deletes extended attributes
+##					- https://github.com/sahib/rmlint/issues/378
+##				- Incremental deduplication.
+##					- https://github.com/sahib/rmlint/issues/349
+##				- Also might file an issue about converting from hardlinks to reflinks failing with errors. (Still no data loss though.)
+##		- 20191014 JC: Renamed from j.* to x9*
+##	TODO:
+##		y For 'recopy':
+##			y Make sure complete xattrs get copied, including rmlint 'duplicate of' attributes.
+##			n If not, need to copy these [x]attrs in fCreateScript_Recopy().
+##			n Consider writing own xattrs for incremental recopy.
+##			y Make sure metadata including correct time/date gets copied [verified yes].
+##		- Create a status file in /tmp that calling scripts can check (last instance of), e.g. with fields:
+##			status_dedup_pass1_val=wip|done|notstarted|error
+##			status_dedup_pass1_updated=yyyymmdd-hhmmss
+##			status_dedup_pass2_val=wip|done|notstarted|error
+##			status_dedup_pass2_updated=yyyymmdd-hhmmss
+##			status_dedup_pass2_sub_val=wip|done|notstarted|error
+##			status_dedup_pass2_sub_updated=yyyymmdd-hhmmss
+##			status_zfs_prop_dedup_restored_val=na|notyet|yes
+##			status_zfs_prop_dedup_restored_updated=yyyymmdd-hhmmss
+##		- Catch 'exit' event, and:
+##			- Delete stuff in /tmp
+##			- Update status file
+##			- Reset zfs dedup property
+##		- Throw error if spaces in rmlint any filespec arguments.
+##		- Get opening realtime output in another terminal window working.
+##		- Add flag: --clear-rmlint-xattrs.
+##		y Store output of fs space to file, keep showing it in status script.
+##		y Launch stats in a new terminal?
+
+
+## User-adjustable constants
+declare -r baseLogDirUnderUserHome="var/log" #..................... No beginning or ending slashes!
+declare -r versionExpected_Rmlint="2.(8|9|[1-9][0-9]+).[0-9]+" #... Regex
+
+## Global constants
+declare -r thisVersion="20190827"
+declare -r fsTypesThatSupport_Clone="btrfs|xfs"
+declare -r fsTypesThatSupport_Recopy="zfs"
+declare -r realtimeStatsUpdateIntervalSecs=10
+
+
+function fPrint_About(){
+	fEcho_Clean ""
+	fEcho_Clean "Deduplicates specified directory and below, via one of three explicit options."
+	fEcho_Clean "Duplicate files aren't deleted, but their redundant space is recovered."
+	fEcho_Clean "Includes the only known high-performance 'offline ZFS deduper' (as of 2019-Aug)."
+	fEcho_Clean "All dedup methods share these common features:"
+	fEcho_Clean "  • Deduplicates redundant file content, even if the files have different names,"
+	fEcho_Clean "    dates, etc. File names and locations don't matter and can frequently change"
+	fEcho_Clean "    between runs, without affecting speed, safety, or space-savings.¹"
+	fEcho_Clean "  • Fast file compare; only hashes files if other attributes fail to rule out"
+	fEcho_Clean "    non-dupes such as filesize, first & last few bytes, and pre-computed hash.¹"
+	fEcho_Clean "  • Stores extended file attributes to both incrementally compare, and"
+	fEcho_Clean "    incrementally dedup. Significantly speeds up successive runs and reduces"
+	fEcho_Clean "    disk wear.¹"
+	fEcho_Clean "  • Xattrs can survive copying to different filesystems & across networks, with"
+	fEcho_Clean "    optional flags built in to most modern Linux copy utilities (eg cp, rsync)."
+	fEcho_Clean "  • Safe; data is not lost even in the case of error or crash."
+	fEcho_Clean "  • Blake2b 512-bit hash algorithm is extremely fast and robust¹ but even in the"
+	fEcho_Clean "    case of nearly impossible collisions, neither Btrfs nor ZFS will clone"
+	fEcho_Clean "    extents or blocks, unless bit-for-bit identical."
+	fEcho_Clean "  • Checks to make sure files aren't in use before cloning."
+	fEcho_Clean "  • Simplifies and extends 'rmlint', tested as the fastest, most robust, and"
+	fEcho_Clean "    well-maintained dedup utility. Git page: https://github.com/sahib/rmlint/"
+	fEcho_Clean "  • Requires a recent version of rmlint, from v2.8.0 master branch, v2.9.0"
+	fEcho_Clean "    release branch, or higher. v2.9.0 was released on 2019-08-20."
+	fEcho_Clean "Note 1: Rmlint feature enabled by default."
+	fEcho_Clean ""
+}
+
+function fPrint_Syntax(){
+#	                                                                                             X
+	fEcho_Clean ""
+	fEcho_Clean "Syntax: $(basename "$0") --METHOD [--no-open-check] \"DIRECTORY\""
+	fEcho_Clean "  METHOD - one of:"
+	fEcho_Clean "    --clone (aka --reflink|--btrfs|--xfs)"
+	fEcho_Clean "      • Uses FIDEDUPERANGE ioctl to natively clone on supported FS like Btrfs.¹"
+	fEcho_Clean "      • Preserves unique metadata, and files uniquely diverge again if edited.¹"
+	fEcho_Clean "      • The most optimal dedup method, on supported filesystems."
+	fEcho_Clean "    --zfs (aka --recopy)"
+	fEcho_Clean "      • Works exactly like rmlint's 'cp --reflink=always' fallback for Btrfs, to"
+	fEcho_Clean "        safely dedupe only redundant file content and nothing else."
+	fEcho_Clean "      • Preserves unique metadata, and files uniquely diverge again if edited."
+	fEcho_Clean "      • Like Btrfs dedupe it can be slow on first run, but since it only dedupes"
+	fEcho_Clean "        pre-calculated dupes and doesn't re-do work from previously runs, is"
+	fEcho_Clean "        significantly faster than leaving 'inline' dedupe on all the time."
+	fEcho_Clean "      • Leverages rmlint to identify dupes, but own codepath for deduping."
+	fEcho_Clean "      • Since the file dedupe step for ZFS involves comparing block hashes"
+	fEcho_Clean "        over an entire pool [vs only a second file for Btrfs], and since"
+	fEcho_Clean "        checking to see if a file is open, is slow in Bash scripting, each file"
+	fEcho_Clean "        dedup will be slower than Btrfs; which further emphasizes the importance"
+	fEcho_Clean "        of only deduping actually identical files and not redoing previous work,"
+	fEcho_Clean "        and further increases the benefit of this 'offline' method over 'inline'."
+	fEcho_Clean "    --hardlink"
+	fEcho_Clean "      • Files with duplicate content are hardlinked together."
+	fEcho_Clean "      • WARNING: Only appropriate for read-only 'snapshot'-type backup folders,"
+	fEcho_Clean "        or other highly-specialized use-cases. Otherwise, hardlinking might"
+	fEcho_Clean "        sound like a good idea, but is almost always a terrible one, with many"
+	fEcho_Clean "        hidden, unforseen, and unnoticed-until-its-too-late 'gotchas'."
+	fEcho_Clean "      • File location and name are the only unique things preserved, everything"
+	fEcho_Clean "        else is shared among hardlinked files."
+	fEcho_Clean "      • Fortunately, it can be 'undone' by first clearing all xattrs, then"
+	fEcho_Clean "        running again with '--undedupe' (even if FS isn't ZFS); but any user,"
+	fEcho_Clean "        application, and/or OS changes to hardlinked files could result in"
+	fEcho_Clean "        permanent, unexpected, and even unnoticed data loss before that."
+	fEcho_Clean "    --undedupe"
+	fEcho_Clean "      • UN-deduplicates duplicate files, which converts them back to"
+	fEcho_Clean "        individually unique files, consuming redundant disk space. This option"
+	fEcho_Clean "        is useful to undo, for example accidental hardlink deduping. Undedupes:"
+	fEcho_Clean "          • Btrfs cloned and reflinked copies."
+	fEcho_Clean "          • ZFS inline deduplicated files."
+	fEcho_Clean "          • Hardlinked files."
+	fEcho_Clean "      • For hardlinks on Btrfs, this is a required intermediate step before"
+	fEcho_Clean "        running again with --clone (otherwise you'll receive harmless errors"
+	fEcho_Clean "        and nothing will change)."
+	fEcho_Clean "  Misc flags:"
+	fEcho_Clean "    --no-open-check"
+	fEcho_Clean "      • If specified, time-consuming checks for open files are skipped. This is"
+	fEcho_Clean "        strongly discouraged! Only advisable on tightly controlled systems that"
+	fEcho_Clean "        are disconnected from internet and local lan, with VMs, containers"
+	fEcho_Clean "        running, apps closed, users logged out, and services stopped."
+	fEcho_Clean "  DIRECTORY: Directory to deduplicate files in an under."
+	fEcho_Clean ""
+}
+
+
+function fMain(){
+
+	## Constants
+	local -r funcName="$(basename "$0").fMain()"
+
+	## Args
+#	local -r arg_Flag="$1"
+#	local -r arg_dirToDedupe="$2"
+	local -r allArgs="$(echo $@)"
+
+	## Validate 1 of 4; dependencies (rmlint is checked later; existence of echo, true, which, /dev/null, and /dev/urandom are assumed)
+	fMustBeInPath basename
+	fMustBeInPath dirname
+	fMustBeInPath realpath
+	fMustBeInPath tput
+	fMustBeInPath fold
+	fMustBeInPath date
+	fMustBeInPath grep
+	fMustBeInPath mktemp
+	fMustBeInPath chown
+	fMustBeInPath chmod
+	fMustBeInPath mkdir
+	fMustBeInPath sed
+	fMustBeInPath awk
+	fMustBeInPath tr
+	fMustBeInPath less
+	fMustBeInPath df
+	fMustBeInPath mount
+	fMustBeInPath sort
+	fMustBeInPath cp
+	fMustBeInPath mv
+	fMustBeInPath rm
+
+	## Constants
+	local -r userHome="${HOME}"
+	local -r serialDT="$(date "+%Y%m%d-%H%M%S")"
+	local -r workingDir_BaseLevel1="${userHome}/${baseLogDirUnderUserHome}/$(basename ${0})"
+	local -r workingDir_BaseLevel2="${workingDir_BaseLevel1}/${serialDT}"  ## "${workingDir_BaseLevel2}/$(basename ${0})_${serialDT}"
+	local -r workingFilespec_Base="${workingDir_BaseLevel2}/rmlint"
+	local -r filespec_Help="${workingDir_BaseLevel2}/0_help.txt"
+	local -r filespec_Log="${workingDir_BaseLevel2}/0_log.txt"
+	local -r filespec_Csv="${workingFilespec_Base}_scan-results.csv"
+	local -r filespec_Json="${workingFilespec_Base}_scan-results.json"
+	local -r filespec_Script_rmlint_pass2="${workingFilespec_Base}_do-dedupe.sh"
+	local -r filespec_Script_rmlint_pass2_sub_recopy="${workingFilespec_Base}_do-dedup_custom-subroutine.sh"
+	local -r verRmlint="$(rmlint --version 2>&1 | grep -iE "version" | grep -iEo "[0-9]\.[0-9]\.[0-9]" || true)"
+	local -r output_desc_Pass1="find duplicate files while also calculating and writing hashes to xattrs for new or changed files"
+	local -r output_desc_Pass2="dedupe with Btrfs clone ioctrl"
+	local -r output_BuildInstructions="See script comments for build instructions"
+	local -r sameFlags_Regex_Clone="--(clone|reflink|btrfs|xfs)"
+	local -r sameFlags_Regex_Recopy="--(zfs|recopy)"
+	local -r sameFlags_Regex_Hardlink="--hardlink"
+	local -r sameFlags_Regex_Undedupe="--undedupe"
+	local -r tmpScript_ShowRealtimeStatus="$(mktemp --dry-run)"
+	local -r tmpScript_ShowPotentiallyHarmfulCommands="$(mktemp --dry-run)"
+	local -r tmpFilespec_origSpaceStats="$(mktemp --dry-run)"
+	local -r zfsGetGrep=" (compression|compressratio|dedup) "
+
+	## Create constants from dynamic data
+	local tmpStr=""; tmpStr="${SUDO_USER}"; [ -z "${tmpStr}" ] && tmpStr="${USER}"; local -r userName="${tmpStr}"
+
+	## Variables
+	local dirToDedupe=""
+	local optsPass1_Pretty=""
+	local optsPass1_Useful=""
+	local friendlyPrint_cmd_Recopy="" #.................................... Populated in fBuildStr_Options(), shown in fPrint_Info().
+	local tmpString=""
+	local doShowSyntax=0
+	local dedupeMethod=""  #............................................... clone|recopy|hardlink [set in this function]
+	local fsType=""  #..................................................... E.g. btrfs, zfs, ext4, xfs, ntfs, etc.; set in fGetFsType().
+	local baseMountPoint="" #.............................................. The base mount point, e.g. '/', '/export/zpool', etc.; set in fGetFsType().
+	local zfsPoolName=""  #................................................ If fsType=zfs, this will contain the name of the pool. Set by fGetFsType().
+	local doCheckForOpenFiles=1
+	local doUndedupe=0
+	local zfsDedup_ChangeTo=""
+	local zfsDedup_Orig="" #...................................... Set by fGetFsType()
+
+	## Scan all arguments to see if we just bail now and show help/version
+	case " ${allArgs,,} " in
+		*" -h "*|*" --help "*)                 doShowSyntax=1 ;;
+		*" -v "*|*" --ver "*|*" --version "*)  doShowSyntax=1 ;;
+	esac
+	if [ $doShowSyntax -ne 0 ]; then fPrint_Copyright_About_Syntax_ThenQuit; fi
+
+	## Process arguments
+	local currentArg=""
+	local -i doBailLoop=0
+	local prevArg="nevermatch_zNHyzdlk0E2LWameiuMwxA"
+	while [ ${doBailLoop} -eq 0 ]; do
+		currentArg="$1"; shift || true
+		if [ -z "${currentArg}" ] && [ -z "${prevArg}" ]; then
+			doBailLoop=1
+		else
+			if [[ ${currentArg,,} =~ --[a-z\-]+ ]]; then
+				if [ "${currentArg,,}" == "--no-open-check" ]; then
+					doCheckForOpenFiles=0
+				elif [[ ${currentArg,,} =~ ${sameFlags_Regex_Clone,,} ]]; then
+					dedupeMethod="clone"
+				elif [[ ${currentArg,,} =~ ${sameFlags_Regex_Recopy,,} ]]; then
+					dedupeMethod="recopy"
+				elif [[ ${currentArg,,} =~ ${sameFlags_Regex_Hardlink,,} ]]; then
+					dedupeMethod="hardlink"
+				elif [[ ${currentArg,,} =~ ${sameFlags_Regex_Undedupe,,} ]]; then
+					dedupeMethod="recopy"
+					doUndedupe=1
+				else
+					fThrowError "${funcName}: Unknown flag '${currentArg}'. [#2005]"
+				fi
+			else
+				if [ -n "${currentArg}" ]; then
+					if [ -n "${arg_dirToDedupe}" ]; then
+						fThrowError "${funcName}: Unknown argument '${currentArg}'. [#2010]"
+					else
+						local -r arg_dirToDedupe="${currentArg}"
+						local dirToDedupe="${arg_dirToDedupe}"
+						if [ -n "${dirToDedupe}" ]; then fNormalizePath_byref dirToDedupe; fi
+						if [ -n "${dirToDedupe}" ]; then dirToDedupe="$(realpath "${arg_dirToDedupe}" 2>/dev/null || true)"; fi
+					fi
+				fi
+			fi
+			prevArg="${currentArg}"
+		fi
+	done
+
+#	## Debug
+#	echo
+#	echo "arg_dirToDedupe .......: '${arg_dirToDedupe}'"
+#	echo "dirToDedupe ...........: '${dirToDedupe}'"
+#	echo "dedupeMethod ..........: '${dedupeMethod}'"
+#	echo "doCheckForOpenFiles ...: '${doCheckForOpenFiles}'"
+#	exit
+
+	## Validate 2 of 4
+	if [ -z "${arg_dirToDedupe}" ];                            then fPrint_Copyright_About_Syntax_ThenQuit "No folder specified."; fi
+	if [ -z "${dirToDedupe}" ] || [ ! -d "${dirToDedupe}" ];   then fPrint_Copyright_About_Syntax_ThenQuit "Specified folder not found: '${arg_dirToDedupe}' (normalized to '${dirToDedupe}')."; fi
+	if [ -z "${dedupeMethod}" ];                               then fPrint_Copyright_About_Syntax_ThenQuit "Invalid option or dedupe method specified."; fi
+	if [ -z "$(which rmlint 2>/dev/null || true)" ];           then fPrint_Copyright_About_Syntax_ThenQuit "Not found in path: rmlint. ${output_BuildInstructions}."; fi
+	if [ "$EUID" -ne 0 ];                                      then fPrint_Copyright_About_Syntax_ThenQuit "Must be run as root."; fi
+	if [[ ! ${verRmlint,,} =~ ${versionExpected_Rmlint,,} ]];  then fPrint_Copyright_About_Syntax_ThenQuit "rmlint version expected: '${versionExpected_Rmlint}'. Actual version: '${verRmlint}'. ${output_BuildInstructions}."; fi
+	
+	## Show something while scanning
+	fEcho_Clean ""
+	fEcho_Clean "[ Checking '${arg_dirToDedupe}' (may take a few minutes) ... ]"
+
+	## Get target filesystem type
+	fGetFsType fsType
+
+	## Validate 3 of 4; incompatible dedupe methods (these are errors; warnings about merely "suboptimal" combos are in fPrint_Info())
+	if [ "${dedupeMethod,,}" == "clone" ] && [[ ! ${fsType,,} =~ ${fsTypesThatSupport_Clone,,} ]];                               then fPrint_Copyright_About_Syntax_ThenQuit "Filesystem type '${fsType}' doesn't support dedup method '--${dedupeMethod}' [according to this script logic]. [#2020]"; fi
+	if [ ${doUndedupe} -eq 1 ] && [ "${dedupeMethod,,}" != "recopy" ];                                                           then fPrint_Copyright_About_Syntax_ThenQuit "Deduplication method '--${dedupeMethod}' is incompatible with '--undedupe'. [#2022]"; fi
+	if [ ${doUndedupe} -eq 0 ] && [ "${dedupeMethod,,}" == "recopy" ] && [[ ! ${fsType,,} =~ ${fsTypesThatSupport_Recopy,,} ]];  then fPrint_Copyright_About_Syntax_ThenQuit "Deduplication method '--${dedupeMethod}' is incompatible with filesystem type '${fsType}'; do you mean '--undedupe'?. [#2022]"; fi
+
+	## Calculate and validate dedup settings
+	if [ "${fsType}" == "zfs" ] && [ "${dedupeMethod,,}" == "recopy" ]; then
+		if [ ${doUndedupe} -eq 1 ] && [ "${zfsDedup_Orig,,}" != "off" ]; then
+			zfsDedup_ChangeTo="off"
+		elif [ ${doUndedupe} -eq 0 ] && [ "${zfsDedup_Orig,,}" == "off" ]; then
+			zfsDedup_ChangeTo="on"
+	#	else
+	#		fEcho_Clean "${funcName}: Unexpected combination of fsType, dedupeMethod, doUndedupe, and zfsDedup_Orig [#2042]:"
+	#		echo "fsType ...........: '${fsType}'"
+	#		echo "dedupeMethod .....: '${dedupeMethod}'"
+	#		echo "doUndedupe .......: '${doUndedupe}'"
+	#		echo "zfsDedup_Orig ....: '${zfsDedup_Orig}'"
+	#		fThrowError ""
+		fi
+	fi
+
+	## Validate 4 of 4; check to make sure there are no open files (this is a one-time check independent of '--no-open-check', which controls checking of each file)
+	local output_lsof="$(lsof 2>/dev/null | grep " ${dirToDedupe}" 2>/dev/null | sort || true)"
+	if [ -n "${output_lsof}" ]; then  
+		fEcho_Clean "${funcName}: There seems to be one or more open files open on '${dirToDedupe}' [#2025]:"
+		fEcho_Clean ""
+		echo -e "${output_lsof}" | fIndent
+		fEcho_ResetBlankCounter
+		fThrowError ""
+	fi
+
+	## Show copyright
+	fEcho_Clean ""
+	fPrint_Copyright
+
+	## Build options string (this is most of half of the real magic this script taps into)
+	fBuildStr_Options
+
+	## Build realtime stats script now (in /tmp), which might be launched by user before answering prompt
+	fCreateScript_ShowRealtimeStatus
+
+	## Display commands to run and other info
+	fPrint_Info
+
+	## Prompt to continue
+	read -p "Continue? (y/n): " answer
+	fEcho_Force
+	if [ "${answer,,}" == "y" ]; then
+
+#		## Doesn't seem to work
+#		## Open realtime stats script in new terminal window, if running in a GUI
+#		echo "XDG_CURRENT_DESKTOP ...: '${XDG_CURRENT_DESKTOP}'"
+#		echo "DESKTOP_SESSION .......: '${DESKTOP_SESSION}'"
+#		echo "GDMSESSION ............: '${GDMSESSION}'"
+#		if [ -n "${XDG_CURRENT_DESKTOP}" ] || [ -n "${DESKTOP_SESSION}" ] || [ -n "${GDMSESSION}" ]; then
+#			if [ -n "$(which x-terminal-emulator 2>/dev/null || true)" ]; then
+#				fEcho_Clean "[ Launching status output in seperate terminal window ... ]"
+#				x-terminal-emulator --hold -e "${tmpScript_ShowRealtimeStatus}"
+#			fi
+#		fi
+
+		## Init; workingDir_BaseLevel2
+		if [ ! -d "${workingDir_BaseLevel2}" ]; then
+			mkdir -p "${workingDir_BaseLevel2}"
+			chown -R ${userName}:${userName} "${workingDir_BaseLevel1}"
+		fi
+
+		## Generate misc files
+		fCreateFile_Help
+		fCreateScript_ShowPotentiallyHarmfulCommands
+
+		## Create log file
+		if [ -e "${filespec_Log}" ]; then
+			fThrowError "${funcName}: Log file already exists: '${filespec_Log}'. [#2030]"
+		else
+			touch "${filespec_Log}"
+		fi
+
+		## Show and log starting free space
+		fEcho_Clean ""
+		fEchoAndLog "Started: $(date "+%Y-%m-%d at %H:%M:%S")."
+		fEchoAndLog ""
+		fEchoAndLog "[** Free space before starting (very approximate): ]"
+		fEchoAndLog_FreeSpace
+		fEcho_ResetBlankCounter
+
+		## Set permissions on existing files
+		chown -R ${userName}:${userName} "${workingDir_BaseLevel2}"
+
+		#makeitso; Find duplicates and create rmlint action script
+		fEchoAndLog
+		fEchoAndLog "[** Running rmlint pass 1 (${output_desc_Pass1}) ...]"
+		case "${dedupeMethod,,}" in
+			"recopy")
+				fCreateScript_Recopy
+				cd "${workingDir_BaseLevel2}"  ## Do this because rmlint custom user cmd can't be a variable; therefore, script reference is hardcoded throughout (and can't contain a directory prefix as a variable).
+				echo "rmlint \"${dirToDedupe}\" ${optsPass1_Useful} -c sh:cmd='./rmlint_do-dedup_custom-subroutine.sh \"$1\" \"$2\"'"
+				rmlint "${dirToDedupe}" ${optsPass1_Useful} -c sh:cmd='./rmlint_do-dedup_custom-subroutine.sh "$1" "$2"' 2>> "${filespec_Log}"
+				;;
+			*)
+				## Correct flags will already be in ${optsPass1_Useful}.
+				fEcho_Clean "rmlint \"${dirToDedupe}\" ${optsPass1_Useful}"
+				rmlint "${dirToDedupe}" ${optsPass1_Useful} 2>> "${filespec_Log}"  ## Only log errors; stdout is just animation.
+				;;
+		esac
+		fEcho_ResetBlankCounter
+
+		## Intermediate reset ownership
+		chown -R ${userName}:${userName} "${workingDir_BaseLevel2}"
+
+		if [ ! -f "${filespec_Script_rmlint_pass2}" ]; then
+			fThrowError "${funcName}: Not found: '${filespec_Script_rmlint_pass2}'. [#2040]"
+		else
+
+			## Temporarily change ZFS dedup
+			if [ -n "${zfsDedup_ChangeTo}" ]; then
+				fEchoAndLog
+				fEchoAndLog "[** Temporarily turning ZFS deduplication ${zfsDedup_ChangeTo} for pool '${zfsPoolName}' ... ]"
+				zfs set dedup=${zfsDedup_ChangeTo} ${zfsPoolName}
+				fEcho_ResetBlankCounter
+			fi
+
+			#makeitso; Do the actual deduping
+			fEchoAndLog
+			fEchoAndLog "[** Running rmlint pass 2 (${output_desc_Pass2}) ... ]"
+			cd "${workingDir_BaseLevel2}"  ## Do this because rmlint custom user cmd can't be a variable; therefore, script reference is hardcoded throughout (and can't contain a directory prefix as a variable).
+			${filespec_Script_rmlint_pass2} -d -x 2>&1 | tee -a "${filespec_Log}"
+			fEcho_ResetBlankCounter
+
+			## Change ZFS dedup setting back
+			if [ -n "${zfsDedup_ChangeTo}" ]; then
+				fEchoAndLog
+				fEchoAndLog "[** Reverting ZFS deduplication for '${zfsPoolName}', back to '${zfsDedup_Orig}' ... ]"
+				zfs set dedup=${zfsDedup_Orig} ${zfsPoolName}
+				fEcho_ResetBlankCounter
+			fi
+
+			## Final reset ownership
+			chown -R ${userName}:${userName} "${workingDir_BaseLevel2}"
+
+			## Show and log ending free space
+			fEchoAndLog ""
+			fEchoAndLog "[** Resulting free space (very approximate): ]"
+			fEchoAndLog_FreeSpace
+			fEchoAndLog ""
+			fEchoAndLog "Finished: $(date "+%Y-%m-%d at %H:%M:%S")."
+			exit 0
+
+		fi
+	else
+		fEcho "User aborted."
+	fi
+	fEcho_Clean ""
+
+}
+
+
+function fBuildStr_Options(){
+	##	History
+	##		- 20190826 JC: Created
+
+	local tmpString=""
+
+	## Common
+	fstrAppend  tmpString  "\n"  "    --no-crossdev"  #............................ Don't cross filesystems.
+	fstrAppend  tmpString  "\n"  "    --see-symlinks"  #........................... Sees but does not follow symlinks.
+#	fstrAppend  tmpString  "\n"  "    --no-followlinks"  #......................... Don't follow symlinks.
+	fstrAppend  tmpString  "\n"  "    --hidden"  #................................. Can break Git.
+#	fstrAppend  tmpString  "\n"  "    --partial-hidden"  #......................... Only traverse hidden directories if they are inside duplicate direrectories. Can help to not break Git files.
+#	fstrAppend  tmpString  "\n"  "    --xattr-clear"  #............................ DON'T USE! 1) It doesn't do what you think [doesn't seem to do anything], and 2) even if it did, 'j.xattrs_clear-rmlint' (that uses generic linux util 'setfattr') is the better way to do it.
+	fstrAppend  tmpString  "\n"  "    --xattr"  #.................................. Shorthand for --xattr-read --xattr-write --write-unfinished. This is the magic sauce, that stores hashes in xattrs, so they don't have to be recreated.
+#	fstrAppend  tmpString  "\n"  "    --xattr-write"  #............................ Older syntax.
+#	fstrAppend  tmpString  "\n"  "    --write-unfinished"  #....................... Older syntax.
+#	fstrAppend  tmpString  "\n"  "    --xattr-read"  #............................. Older syntax.
+#	fstrAppend  tmpString  "\n"  "    --threads=1"  #.............................. Debugging feature: Attempt to limit disk thrashing because normally two threads read concurrently.
+	fstrAppend  tmpString  "\n"  "    --threads-per-disk=1"  #..................... Undocumented feature: Attempt to limit disk thrashing because normally two threads read concurrently.
+#	fstrAppend  tmpString  "\n"  "    --algorithm=blake2bp"  #..................... blake2bp is a 4x threaded version blake2b. Important note: blake2bp yields different checksum than blake2b! Also, blake2b [the default] is already allegedly 2-4x faster than sha256.
+#	fstrAppend  tmpString  "\n"  "    --types=none,duplicates,duplicatedirs"  #.... Find duplicate files and directories.
+	fstrAppend  tmpString  "\n"  "    --types=none,duplicates"  #.................. Find duplicate files.
+#	fstrAppend  tmpString  "\n"  "    --size 4k"  #................................ Limit to files larger than 4 KiB.
+#	fstrAppend  tmpString  "\n"  "    --size 0-4G"  #.............................. Limit to files smaller than 4 GiB.
+#	fstrAppend  tmpString  "\n"  "    --rank-by=pHma"  #........................... Seems to conflict with several options. To be safe, don't use.
+	fstrAppend  tmpString  "\n"  "    --no-backup"  #.............................. Not-yet documented feature: Don't output default rmlint.sh and rmlint.json.
+	fstrAppend  tmpString  "\n"  "    -o csv:${filespec_Csv}"  #........... Output CSV
+	fstrAppend  tmpString  "\n"  "    -o json:${filespec_Json}"  #......... Output JSON
+	fstrAppend  tmpString  "\n"  "    -o sh:${filespec_Script_rmlint_pass2}"  #............. Output shell script to do the actual work.
+#	fstrAppend  tmpString  "\n"  "    -v"  #....................................... Verbose.
+#	fstrAppend  tmpString  "\n"  "    -vvv"  #..................................... Very more verbose.
+#	fstrAppend  tmpString  "\n"  "    -VVV"  #..................................... Very less verbose.
+	fstrAppend  tmpString  "\n"  "    -o progressbar"  #........................... This is handy but not well-implemented.
+#	fstrAppend  tmpString  "\n"  "    --progress"  #............................... Don't use; Macro for a bunch of stuff.
+#	fstrAppend  tmpString  "\n"  "    -c progressbar:fancy"  #..................... Actually less fancy than the non-fancy bar.
+#	fstrAppend  tmpString  "\n"  "    -o pretty:stdout"  #......................... Not good. Outputs list of shell commands for result.
+	fstrAppend  tmpString  "\n"  "    -o summary"  #............................... Show stats at the end.
+	fstrAppend  tmpString  "\n"  "    --no-with-color"  #.......................... Monocrhome
+
+	## Per-type
+	case "${dedupeMethod,,}" in
+		"clone")
+			fstrAppend  tmpString  "\n"  "    --config=sh:handler=clone,reflink"  #...................... Tell shell script to clone duplicates to save space. Doesn't work with --types=duplicatedirs.
+			;;
+		"recopy")
+			friendlyPrint_cmd_Recopy="-c sh:cmd=./rmlint_do-dedup_custom-subroutine.sh “[arg1]” “[arg2]”" #............................ Shown in fPrint_Info().
+		#	fstrAppend  tmpString  "\n"  "    --config=sh:handler=usercmd"  #............................ Tell shell script to run custom script.
+		#	fstrAppend  tmpString  "\n"  "    --config=sh:cmd='${tmpCmd}'"  #............................ Tell shell script which custom script to run.
+			;;
+		"hardlink")
+			fstrAppend  tmpString  "\n"  "    --config=sh:handler=hardlink"  #........................... Tell shell script to hardlink duplicates together to save space. DON'T USE ON LIVE SYSTEMS! Only "safe" for read-only snapshot-style backups. Doesn't work with --types=duplicatedirs.
+			;;
+	esac
+
+	## Convert newlines to spaces, and remove redundant whitespace, for actual use in command
+	optsPass1_Pretty="$(echo -e "${tmpString}")" #................. Convert '\n' to actual newlines
+	optsPass1_Useful="$(fStrNormalize "${optsPass1_Pretty}")" #.... Convert all whitespace to single spaces
+
+}
+
+
+function fPrint_Copyright_About_Syntax_ThenQuit(){
+	local -r additionalLineOfText="$@"
+	fPrint_Copyright
+	fPrint_About
+	fPrint_Syntax
+	if [ -n "${additionalLineOfText}" ]; then fEcho_Clean "Error: ${additionalLineOfText}"; fi
+	exit 1
+}
+
+
+function fPrint_Copyright(){
+	fEcho_Clean ""
+	fEcho_Clean "$(basename "$0") version ${thisVersion}"
+	fEcho_Clean "Copyright (c) 2018-2019 James Collier."
+	fEcho_Clean "License GPLv3+: GNU GPL version 3 or later, full text at:"
+	fEcho_Clean "    https://www.gnu.org/licenses/gpl-3.0.en.html"
+	fEcho_Clean "There is no warranty, to the extent permitted by law."
+	fEcho_Clean ""
+}
+
+
+function fPrint_Info(){
+	##	History
+	##		- 20190826 JC: Created
+
+	## Standard stuff
+	fEcho_Clean ""
+	fEcho_Clean "Deduplicate filesystem at and under .......: ${dirToDedupe}"
+	fEcho_Clean "Detected base mount point .................: ${baseMountPoint}"
+	fEcho_Clean "Filesystem type ...........................: ${fsType}"
+	if [ ${doUndedupe} -eq 1 ]; then
+		fEcho_Clean "Dedupe method .............................: undedupe"
+	else
+		fEcho_Clean "Dedupe method .............................: ${dedupeMethod}"
+	fi
+	if [ "${fsType,,}" == "zfs" ]; then
+		fEcho_Clean "ZFS pool name .............................: ${zfsPoolName}"
+		if [ "${dedupeMethod,,}" == "recopy" ]; then
+			fEcho_Clean "Check for open files? .....................: ${doCheckForOpenFiles}"
+		fi
+		if [ -n "${zfsDedup_ChangeTo}" ]; then
+			fEcho_Clean "Before dedupe, zfs 'dedup' prop set to ....: ${zfsDedup_ChangeTo}"
+			fEcho_Clean "After dedupe, zfs 'dedup' prop reset to ...: ${zfsDedup_Orig}"
+		fi
+	fi
+	fEcho_Clean "Location of output and scripts ............: ${workingDir_BaseLevel2}"
+	fEcho_Clean "Help file .................................: ${filespec_Help}"
+	fEcho_Clean "Log file ..................................: ${filespec_Log}"
+	fEcho_Clean "CSV .......................................: ${filespec_Csv}"
+	fEcho_Clean "JSON ......................................: ${filespec_Json}"
+	fEcho_Clean "rmlint 'pass 2' action script .............: ${filespec_Script_rmlint_pass2}"
+	if [ "${dedupeMethod,,}" == "recopy" ]; then
+		fEcho_Clean "Custom sub-script for zfs|recopy ..........: ${workingDir_BaseLevel2}/./rmlint_do-dedup_custom-subroutine.sh"
+	fi
+#	fEcho_Clean "See file-altering actions in pass 2 .......: ${tmpScript_ShowPotentiallyHarmfulCommands}"
+	fEcho_Clean "Monitor output in real-time ...............: ${tmpScript_ShowRealtimeStatus}"
+#	fEcho_Clean "  Note: This should open automatically in a new terminal, if running a GUI desktop."
+#	fEcho_Clean "  Note: Space stats script ................: ${tmpFilespec_origSpaceStats}"
+
+	fEcho_Clean ""
+	fEcho_Clean "Options; Pass 1 (${output_desc_Pass1}):"
+	fEcho_Clean -e "${optsPass1_Pretty}"
+	if [ "${dedupeMethod,,}" == "recopy" ]; then
+		fEcho_Clean "    ${friendlyPrint_cmd_Recopy}"
+	fi
+	fEcho_Clean ""
+	fEcho_Clean "Whole command; Pass 1 (${output_desc_Pass1}):"
+	case "${dedupeMethod,,}" in
+		"recopy") fEcho_Clean "    rmlint \"${dirToDedupe}\" ${optsPass1_Useful} ${friendlyPrint_cmd_Recopy}" ;;
+		*)        fEcho_Clean "    rmlint \"${dirToDedupe}\" ${optsPass1_Useful}" ;;
+	esac
+	fEcho_Clean ""
+	fEcho_Clean "Whole command; Pass 2 (${output_desc_Pass2}):"
+	fEcho_Clean "    ${filespec_Script_rmlint_pass2} -d -x"
+	if [ "${dedupeMethod,,}" == "recopy" ]; then
+		fEcho_Clean ""
+		fEcho_Clean "Whole command; Pass 2's recopy subroutine:"
+		fEcho_Clean "    ./rmlint_do-dedup_custom-subroutine.sh"
+	fi
+	fEcho_Clean ""
+	fEcho_Clean "WARNING: Verify that csv, json, sh, and/or py file arguments above have no spaces in them."
+	fEcho_Clean "WARNING: Each pass could take days, especially the first time. Make sure you can do this, and have backup power."
+	fEcho_Clean "NOTE ..: Breaking out of script may require pressing CTRL+C for each step, but each may take some time to exit softly."  ## https://stackoverflow.com/a/9196340
+	fEcho_Clean ""
+
+	## Warn about suboptimal combinations
+	tmpStr=""
+	if [[ ${fsType,,} =~ ${fsTypesThatSupport_Clone,,} ]] && [ "${dedupeMethod,,}" != "clone" ]; then
+		fstrAppend tmpStr "\n" "ALERT: Filesystem type '${fsType}' natively supports '--clone', which is better"
+		fstrAppend tmpStr "\n" "       better & safer than '--${dedupeMethod}'."
+		fstrAppend tmpStr "\n" "       Also note that for some COW filesystems, you can't convert directly"
+		fstrAppend tmpStr "\n" "       from hardlink to clone, you have to '--undedupe' first."
+	elif [[ ${fsType,,} =~ ${fsTypesThatSupport_Recopy,,} ]] && [ "${dedupeMethod,,}" != "recopy" ]; then
+		fstrAppend tmpStr "\n" "ALERT: Filesystem type '${fsType}' can be more safely deduped with '--recopy',"
+		fstrAppend tmpStr "\n" "       rather than '--${dedupeMethod}'."
+	fi
+	if [ "${dedupeMethod,,}" == "recopy" ]; then
+		fstrAppend tmpStr "\n" "NOTE:  Dedupe method '--recopy' seems to work best with >1 run. Why this seems"
+		fstrAppend tmpStr "\n" "       to be the case, is not yet clear."
+	fi
+	if [ "${dedupeMethod,,}" == "hardlink" ]; then
+		fstrAppend tmpStr "\n" "ALERT: Dedupe method of '--hardlink' is unsafe for regular read/write filesystems,"
+		fstrAppend tmpStr "\n" "       because all duplicates, no matter how tiny or obscure, will become linked"
+		fstrAppend tmpStr "\n" "       to the same data. Any user, application, or OS change to one, will apply"
+		fstrAppend tmpStr "\n" "       to all of them. This would typically be a very unexpected - and worse,"
+		fstrAppend tmpStr "\n" "       unpredictable - outcome. One of the few useful use-cases for hardlinking"
+		fstrAppend tmpStr "\n" "       duplicate files like this, would be for a 'read-only', 'snapshot'-style"
+		fstrAppend tmpStr "\n" "       backup filesystem, and other very narrow, highly specialized use-cases."
+	fi
+
+	## Final output
+	if [ -n "${tmpStr}" ]; then
+		fEcho_Clean ""
+		fEcho_Clean "${tmpStr}"
+		fEcho_Clean ""
+	fi
+
+}
+
+
+function fCleanup(){
+	##	History
+	##		- 20190828 JC: Created
+	fEcho_Clean
+}
+
+
+function fGetFsType(){
+	##	Parent varialbes:
+	##		Read ...: dirToDedupe
+	##		Set ....: fsType, baseMountPoint, zfsPoolName, zfsDedup_Orig
+	##	History
+	##		- 20190827 JC: Created
+
+	## Constants
+	local -r funcName="$(basename "$0").fGetFsType()"
+
+	## Variables
+	local tmpStr=""
+
+	## Init
+	fsType=""
+	baseMountPoint=""
+	zfsPoolName=""
+	zfsDedup_Orig=""
+
+	## Get filesystem type
+	if [ -z "${dirToDedupe}" ]; then
+		fThrowError "${funcName}: No path specified to check filsystem type of. [#010]"
+	elif [ ! -d "${dirToDedupe}" ]; then
+		fThrowError "${funcName}: Specified path not found: '${dirToDedupe}'. [#020]"
+	else
+		tmpStr="$(df "${dirToDedupe}" 2>/dev/null || true)"
+	#	fEchoVarAndVal tmpStr #Debug
+		if [ -z "${tmpStr}" ]; then
+			fThrowError "${funcName}: Could not determine filesystem type for '${dirToDedupe}' ('df' returned empty). [#030]"
+		else
+			tmpStr="$(echo -e "${tmpStr}" | grep -ivE "Mounted on" 2>/dev/null | head -n 1 || true)"
+		#	fEchoVarAndVal tmpStr #Debug
+			if [ -z "${tmpStr}" ]; then
+				fThrowError "${funcName}: Could not determine filesystem type ('df|grep' results returned empty). [#040]"
+			else
+				tmpStr="$(echo -e "${tmpStr}" | awk '{print $6}' 2>/dev/null || true)"
+			#	fEchoVarAndVal tmpStr #Debug
+				if [ -z "${tmpStr}" ]; then
+					fThrowError "${funcName}: Could not determine filesystem type ('df|grep|awk' results returned empty). [#050]"
+				else
+					baseMountPoint="${tmpStr}"
+					tmpStr="$(mount | grep "${tmpStr} " 2>/dev/null | sort | head -n 1 || true)"  ## Bugfix: Space after ${tmpStr} insures that '/' doesn't randomly match very first path.
+				#	fEchoVarAndVal baseMountPoint #Debug
+				#	fEchoVarAndVal tmpStr #Debug
+					if [ -z "${tmpStr}" ]; then
+						fThrowError "${funcName}: Could not determine filesystem type ('mount|grep' results returned empty). [#060]"
+					else
+						tmpStr="$(echo "${tmpStr}" | grep -iEo 'type [a-z0-9]+' 2>/dev/null | awk '{print $2}' 2>/dev/null || true)"
+					#	fEchoVarAndVal tmpStr #Debug
+						if [ -z "${tmpStr}" ]; then
+							fThrowError "${funcName}: Could not determine filesystem type ('mount|grep|grep|awk' results returned empty). [#070]"
+						else
+							fsType="${tmpStr,,}"
+						#	fEchoVarAndVal fsType #Debug
+						fi
+					fi
+				fi
+			fi
+		fi
+	fi
+
+	## If ZFS, also get poolname
+	case "${fsType}" in
+		"zfs")
+			## Populate zfsPoolName
+			fMustBeInPath zfs
+			zfsPoolName="$(zfs get mountpoint 2>/dev/null | grep -iE "${baseMountPoint}" 2>/dev/null | sort | head -n 1 | awk '{print $1}' 2>/dev/null || true)"
+		#	fEchoVarAndVal zfsPoolName #Debug
+			if [ -z "${zfsPoolName}" ]; then
+				fThrowError "${funcName}: Could not determine ZFS pool name for '${dirToDedupe}'. [#080]"
+			fi
+
+			## Get current state of ZFS dedup
+			if [ "${dedupeMethod,,}" == "recopy" ]; then
+				zfsDedup_Orig=""
+				zfsDedup_Orig="$(zfs get dedup ${zfsPoolName} 2>/dev/null | grep 'dedup' 2>/dev/null | awk '{print $3}' 2>/dev/null || true)"
+				if [ -z "${zfsDedup_Orig}" ] || [[ ! ${zfsDedup_Orig,,} =~ on|off|verify|sha256|sha512|skein|edonr ]]; then
+					fThrowError "${funcName}: Could not determine status of dedup flag for ZFS Pool '${zfsPoolName}', result is '${zfsDedup_Orig}'."
+				fi
+			fi
+
+			;;
+	esac
+
+}
+
+
+function fGetLoggableFreeSpaceOutput_byref(){
+	##	History
+	##		- 20190828 JC: Created
+	##	Parent variables read:
+	##		dirToDedupe
+	##		zfsPoolName
+
+	## Constants
+	local -r funcName="$(basename "$0").fGetLoggableFreeSpaceOutput_byref()"
+
+	## Args
+	local -r varName="$1"
+
+	## Variables
+	local returnVal=""
+	local -i prevLineWasBlank=0
+
+	## Validate
+	if [ -z "${varName}" ]; then
+		fThrowError "${funcName}: No variable name specified to populate with results. [#3010]"
+	elif [ -z "${dirToDedupe}" ]; then
+		fThrowError "${funcName}: No folder specified. [#3020]"
+	elif [ ! -d "${dirToDedupe}" ]; then
+		fThrowError "${funcName}: Specified folder doesn't exist, or isn't a folder. [#3030]"
+	else
+
+		## FS-specific free space calculations
+		case "${fsType}" in
+
+			"btrfs")
+
+				fMustBeInPath btrfs
+
+				tmpStr=""; tmpStr="$(btrfs fi usage "${dirToDedupe}" 2>/dev/null | grep -iE 'Device (size|allocated):|  Used:|Free \(estimated\):' 2>/dev/null  | column -t -s $'\t' 2>/dev/null || true)"
+				if [ -z "${tmpStr}" ]; then
+					fThrowError "${funcName}: Unable to determine Btrfs space stats on '${dirToDedupe}', via: btrfs fi usage '${dirToDedupe}'. [#3040]"
+				else
+					if [ ${prevLineWasBlank} -eq 0 ]; then fstrAppend returnVal "\n" ""; fEchoAndLog ""; prevLineWasBlank=1; fi
+					fstrAppend returnVal "\n" "btrfs fi usage '${dirToDedupe}':"; prevLineWasBlank=0
+					fstrAppend returnVal "\n" "${tmpStr}"
+				#	if [ ${prevLineWasBlank} -eq 0 ]; then fstrAppend returnVal "\n" ""; fEchoAndLog ""; prevLineWasBlank=1; fi
+				fi
+				;;
+
+			"zfs")
+
+				fMustBeInPath zpool
+				fMustBeInPath zfs
+
+				tmpStr=""; tmpStr="$(zpool list ${zfsPoolName} 2>/dev/null || true)"
+				if [ -z "${tmpStr}" ]; then
+					fThrowError "${funcName}: Unable to determine ZFS space stats on '${dirToDedupe}', via: zpool list ${zfsPoolName}. [#3050]"
+				else
+					if [ ${prevLineWasBlank} -eq 0 ]; then fstrAppend returnVal "\n" ""; fEchoAndLog ""; prevLineWasBlank=1; fi
+					fstrAppend returnVal "\n" "zpool list ${zfsPoolName}:"; prevLineWasBlank=0
+					fstrAppend returnVal "\n" "${tmpStr}"
+				#	if [ ${prevLineWasBlank} -eq 0 ]; then fstrAppend returnVal "\n" ""; fEchoAndLog ""; prevLineWasBlank=1; fi
+				fi
+
+				tmpStr=""
+				tmpStr="$(zfs get all ${zfsPoolName} 2>/dev/null | grep -iE "${zfsGetGrep}" 2>/dev/null || true)"
+				if [ -z "${tmpStr}" ]; then
+					fThrowError "${funcName}: Unable to determine ZFS space stats on '${dirToDedupe}', via: zfs get all ${zfsPoolName} | grep -iE '${zfsGetGrep}'. [#3060]"
+				else
+					if [ ${prevLineWasBlank} -eq 0 ]; then fstrAppend returnVal "\n" ""; fEchoAndLog ""; prevLineWasBlank=1; fi
+					fstrAppend returnVal "\n"  "zfs get all ${zfsPoolName} | grep -iE '${zfsGetGrep}':"; prevLineWasBlank=0
+					fstrAppend returnVal "\n"  "${tmpStr}"
+				#	if [ ${prevLineWasBlank} -eq 0 ]; then fstrAppend returnVal "\n" ""; fEchoAndLog ""; prevLineWasBlank=1; fi
+				fi
+
+				;;
+
+		esac
+
+		## Generic free space calculation
+		tmpStr=""
+		tmpStr="$(df -h "${dirToDedupe}" 2>/dev/null || true)"
+		if [ -z "${tmpStr}" ]; then
+			fThrowError "${funcName}: Unable to determine space stats on '${dirToDedupe}' via: df -h '${dirToDedupe}'. [#3070]"
+		else
+			if [ ${prevLineWasBlank} -eq 0 ]; then fstrAppend returnVal "\n" ""; fEchoAndLog ""; prevLineWasBlank=1; fi
+			fstrAppend returnVal "\n"  "df -h '${dirToDedupe}':"; prevLineWasBlank=0
+			fstrAppend returnVal "\n"  "${tmpStr}"
+		#	if [ ${prevLineWasBlank} -eq 0 ]; then fstrAppend returnVal "\n" ""; fEchoAndLog ""; prevLineWasBlank=1; fi
+		fi
+
+	fi
+
+	## Populate variable with results
+	eval "${varName}=\"${returnVal}\""
+}
+
+
+function fEchoAndLog_FreeSpace(){
+
+	## Get the space report
+	local spaceReport=""
+	fGetLoggableFreeSpaceOutput_byref spaceReport
+
+	## Log space report
+	fEchoAndLog "${spaceReport}"
+
+}
+
+
+function fEchoAndLog(){
+	if [ -n "$1" ]; then
+		fEcho_Clean "$1"
+		echo -e "$1" >> "${filespec_Log}"
+	else
+		if [ "${vmbLastEchoWasBlank}" != "true" ]; then
+			echo
+			echo >> "${filespec_Log}"
+		fi
+		vmbLastEchoWasBlank="true"
+	fi
+}
+
+
+function fCreateScript_Recopy(){
+	##	History
+	##		- 20190827 JC: Created.
+	##	TODO:
+	##		- Detect if previous call resulted in error, and bail every subsequent time.
+	
+	cd "${workingDir_BaseLevel2}"  ## Do this because rmlint custom user cmd can't be a variable; therefore, script reference is hardcoded throughout (and can't contain a directory prefix as a variable).
+	touch                "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "#!/bin/bash" > "./rmlint_do-dedup_custom-subroutine.sh"
+
+	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "function fMain(){"                                                                                                                                                                                                 >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	## Since this function deletes a file, we're going overboard with triple-checks before deleting or renaming any data."                                                                                           >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	## Constants"                                                                                                                                                                                                    >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	local -r funcName=\"\$(basename \"\$0\").fMain()\""                                                                                                                                                              >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	local -r -i minEt_lsof=2  ## Minimum number of seconds we expect lsof to take (to validate that it worked, and determine if we should run again before delete/rename)."                                          >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	local -r ext_Temp=\"tmp\""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	local -r ext_OrigToDelete=\"todelete\""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	## Args"                                                                                                                                                                                                         >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	local -r filespec_OrigToDedup=\"\$(realpath \"\$1\" 2>/dev/null || true)\""                                                                                                                                      >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	local -r filespec_FyiIsDuplicateOf=\"\$(realpath \"\$2\" 2>/dev/null || true)\""                                                                                                                                 >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	local -r arg3=\"\$3\""                                                                                                                                                                                           >> "./rmlint_do-dedup_custom-subroutine.sh"
+
+#	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+#	echo "	## Debug"                                                                                                                                                                                                          >> "./rmlint_do-dedup_custom-subroutine.sh"
+#	echo "	echo \"arg 1 .......................: '\$1'\""                                                                                                                                                                     >> "./rmlint_do-dedup_custom-subroutine.sh"
+#	echo "	echo \"arg 2 .......................: '\$2'\""                                                                                                                                                                     >> "./rmlint_do-dedup_custom-subroutine.sh"
+#	echo "	echo \"filespec_OrigToDedup ........: '\${filespec_OrigToDedup}'\""                                                                                                                                                 >> "./rmlint_do-dedup_custom-subroutine.sh"
+#	echo "	echo \"filespec_FyiIsDuplicateOf ...: '\${filespec_FyiIsDuplicateOf}'\""                                                                                                                                            >> "./rmlint_do-dedup_custom-subroutine.sh"
+#	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+#	echo "	echo \"Test Error\""                                                                                                                                                                                               >> "./rmlint_do-dedup_custom-subroutine.sh"
+#	echo "	exit 1"                                                                                                                                                                                                            >> "./rmlint_do-dedup_custom-subroutine.sh"
+
+	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	## Variables"                                                                                                                                                                                                    >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	local filespec_DedupedTempCopy=\"\""                                                                                                                                                                             >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	local filespec_OrigTempToDelete=\"\""                                                                                                                                                                            >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	local output_losf=\"\""                                                                                                                                                                                          >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	local -i startTime=0"                                                                                                                                                                                            >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	local -i endTime=0"                                                                                                                                                                                              >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	local -i et_lsof=0"                                                                                                                                                                                              >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	local -i et_cp=0"                                                                                                                                                                                              >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	local -i et_rm=0"                                                                                                                                                                                              >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	local prop_fGetValidTempFilespec_ext=\"\""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	local prop_fGetValidTempFilespec_result=\"\""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+
+	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	if [ -z \"\${filespec_OrigToDedup}\" ]; then"                                                                                                                                                                    >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "		fThrowError \"\${funcName}: Source filespec is empty, skipping (arg1 = '\$1'). [#1004]\""                                                                                                                    >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	elif [ ! -f \"\${filespec_OrigToDedup}\" ]; then"                                                                                                                                                                >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "		echo \"FYI: Source filespec isn't a file or doesn't exist: '\${filespec_OrigToDedup}'. [#1006]\""                                                                                                            >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	else"                                                                                                                                                                                                            >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "		## Get intermediate filespecs"                                                                                                                                                                               >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "		fGetValidTempFilespec \"\${ext_Temp}\""                                                                                                                 >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "			filespec_DedupedTempCopy=\"\${prop_fGetValidTempFilespec_result}\""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "		fGetValidTempFilespec \"\${ext_OrigToDelete}\""                                                                                                            >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "			filespec_OrigTempToDelete=\"\${prop_fGetValidTempFilespec_result}\""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+#	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+#	echo "		## Debug"                                                                                                                                                                                                    >> "./rmlint_do-dedup_custom-subroutine.sh"
+#	echo "		echo \"DEBUG; \$(basename \"\$0\").fMain():\""                                                                                                                                                               >> "./rmlint_do-dedup_custom-subroutine.sh"
+#	echo "		echo \"filespec_OrigToDedup ........: '\${filespec_OrigToDedup}'\""                                                                                                                                          >> "./rmlint_do-dedup_custom-subroutine.sh"
+#	echo "		echo \"filespec_FyiIsDuplicateOf ...: '\${filespec_FyiIsDuplicateOf}'\""                                                                                                                                     >> "./rmlint_do-dedup_custom-subroutine.sh"
+#	echo "		echo \"filespec_DedupedTempCopy ....: '\${filespec_DedupedTempCopy}'\""                                                                                                                                      >> "./rmlint_do-dedup_custom-subroutine.sh"
+#	echo "		echo \"filespec_OrigTempToDelete ...: '\${filespec_OrigTempToDelete}'\""                                                                                                                                     >> "./rmlint_do-dedup_custom-subroutine.sh"
+#	echo "		echo \"arg3 ........................: '\${arg3}'\""                                                                                                                                                          >> "./rmlint_do-dedup_custom-subroutine.sh"
+#	echo "		exit"                                                                                                                                                                                                        >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "		## Final redundant checks (this is important!)"                                                                                                                                                              >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "		if [ -z \"\${filespec_OrigToDedup}\" ]; then"                                                                                                                                                                >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "			fThrowError \"\${funcName}: Source filespec is empty, skipping (arg1 = '\$1'). [#1010]\""                                                                                                                >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "		elif [ -z \"\${filespec_DedupedTempCopy}\" ]; then"                                                                                                                                                          >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "			fThrowError \"\${funcName}: Target temp filespec is empty, skipping (source filespec = '\${filespec_OrigToDedup}'). [#1020]\""                                                                           >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "		elif [ \"\${filespec_OrigToDedup}\" == \"\${filespec_DedupedTempCopy}\" ]; then"                                                                                                                             >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "			fThrowError \"\${funcName}: Source and temp filespecs are the same: '\${filespec_OrigToDedup}'. [#1030]\""                                                                                               >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "		elif [ \"\${filespec_OrigToDedup}\" == \"\${filespec_OrigTempToDelete}\" ]; then"                                                                                                                            >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "			fThrowError \"\${funcName}: Source and temp-to-delete filespecs are the same: '\${filespec_OrigToDedup}'. [#1040]\""                                                                                     >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "		elif [ ! -f  \"\${filespec_OrigToDedup}\" ]; then"                                                                                                                                                           >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "			echo \"Warning: Source filespec doesn't exist, skipping: '\${filespec_OrigToDedup}'. [#1050]\""                                                                                                          >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "		elif [ -f  \"\${filespec_DedupedTempCopy}\" ]; then"                                                                                                                                                         >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "			fThrowError \"\${funcName}: Intermediate temp filespec already exists: '\${filespec_DedupedTempCopy}'. [#1060]\""                                                                                        >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "		elif [ -f  \"\${filespec_OrigTempToDelete}\" ]; then"                                                                                                                                                        >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "			fThrowError \"\${funcName}: Intermediate temp filespec already exists: '\${filespec_OrigTempToDelete}'. [#1070]\""                                                                                       >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "		else"                                                                                                                                                                                                        >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "			echo \"  FYI - duplicate of .........: \${filespec_FyiIsDuplicateOf}\""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "			echo \"  File to recopy to self .....: \${filespec_OrigToDedup}\""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "			echo \"  Intermediate temp file .....: \${filespec_DedupedTempCopy}\""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "			echo \"  File to delete last step ...: \${filespec_OrigTempToDelete}\""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+if [ ${doCheckForOpenFiles} -eq 1 ]; then
+	echo "			## See if file is open, and time how long it takes to figure that out (which is non-trivial)."                                                                                                           >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "			echo \"  [ Checking to see if file is open ... ]\""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "			startTime=\$(date \"+%Y%m%d%H%M%S\")"                                                                                                                                                                    >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "			output_losf=\"\$(lsof 2>/dev/null | grep \"\${filespec_OrigToDedup}\" 2>/dev/null | head -n 1 2>/dev/null || true)\""                                                                                    >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "			endTime=\$(date \"+%Y%m%d%H%M%S\")"                                                                                                                                                                      >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "			et_lsof=\$((endTime-startTime))"                                                                                                                                                                         >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "			echo \"  ET to check if file open ...: \${et_lsof}\""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "			if [ \${et_lsof} -lt \${minEt_lsof} ]; then"                                                                                                                                                             >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "				fThrowError \"\${funcName}: 'lsof' didn't take long enough to run (minimum \${minEt_lsof} seconds), so we can't be sure it actually did run, which is critical. [#1080]\""                           >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "			elif [ -n \"\${output_losf}\" ]; then"                                                                                                                                                                   >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "				echo \"  FYI: File open, skipping dedup: '\${filespec_OrigToDedup}'.\""                                                                                                                                >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "			else"                                                                                                                                                                                                    >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+fi
+	echo "				## Copy to temp and time how long it takes"                                                                                                                                                          >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "				echo \"  [ Copying space-hogging original to deduped *.\${ext_Temp} ... ]\""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "				startTime=\$(date \"+%Y%m%d%H%M%S\")"                                                                                                                                                                >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "				cp --preserve=all \"\${filespec_OrigToDedup}\" \"\${filespec_DedupedTempCopy}\"  ## FILESYSTEM CHANGE"                                                                                                                     >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "				endTime=\$(date \"+%Y%m%d%H%M%S\")"                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "				et_cp=\$((endTime-startTime))"                                                                                                                                                                     >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "				echo \"  ET to copy to temp .........: \${et_cp}\""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "				## Doublecheck to make sure temp copy exists"                                                                                                                                                        >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "				if [ ! -f  \"\${filespec_DedupedTempCopy}\" ]; then"                                                                                                                                                 >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "					fThrowError \"\${funcName}: Intermediate temp copy failed: '\${filespec_DedupedTempCopy}'. [#1090]\""                                                                                            >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "				else"                                                                                                                                                                                                >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+if [ ${doCheckForOpenFiles} -eq 1 ]; then
+	echo "					## If cp took a long time, check again to see if orig is open"                                                                                                                                   >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "					if [ \${et_cp} -gt \${et_lsof} ]; then"                                                                                                                                                        >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "						echo \"  [ Copy took longer than initial open check; so checking again if open ... ]\""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "						output_losf=\"\$(lsof 2>/dev/null | grep \"\${filespec_OrigToDedup}\" 2>/dev/null | head -n 1 2>/dev/null || true)\""                                                                        >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "						if [ -n \"\${output_losf}\" ]; then"                                                                                                                                                         >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "							echo \"FYI: File open, skipping dedup: '\${filespec_OrigToDedup}'.\""                                                                                                                    >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "						fi"                                                                                                                                                                                          >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "					fi"                                                                                                                                                                                              >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "					if [ -z \"\${output_losf}\" ]; then"                                                                                                                                                             >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+fi
+	echo "						## From this point on, things will go more quickly (except possibly rm which can be slow on COW filesystems), so make sure fs state is still kosher."                                                                             >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "						if [ ! -f  \"\${filespec_OrigToDedup}\" ]; then"                                                                                                                                             >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "							fThrowError \"\${funcName}: Source filespec doesn't exist, after copying to deduped temp: '\${filespec_OrigToDedup}'. [#1100]\""                                                         >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "						elif [ -f  \"\${filespec_OrigTempToDelete}\" ]; then"                                                                                                                                        >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "							fThrowError \"\${funcName}: Intermediate 'to-delete' temp filespec already exists: '\${filespec_OrigTempToDelete}'. [#1110]\""                                                           >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "						else"                                                                                                                                                                                        >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "							## Rename original to 'to-delete'"                                                                                                                                                       >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "							echo \"  [ Renaming space-hogging original to *.\${ext_OrigToDelete} ... ]\""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "							mv \"\${filespec_OrigToDedup}\" \"\${filespec_OrigTempToDelete}\"  ## FILESYSTEM CHANGE"                                                                                                                       >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "							if [ -f \"\${filespec_OrigToDedup}\" ] || [ ! -f  \"\${filespec_OrigTempToDelete}\" ]; then"                                                                                             >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "								echo \"  FYI: Could not rename '\${filespec_OrigToDedup}' to 'to-delete' temp filespec, skipping. [#1120]\""                                                                                >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "							elif [ ! -f \"\${filespec_DedupedTempCopy}\" ]; then"                                                                                                                                    >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "								fThrowError \"\${funcName}: Deduped temp copy doesn't exist: '\${filespec_DedupedTempCopy}'. [#1130]\""                                                                              >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "							else"                                                                                                                                                                                    >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "								## Rename temp deduped to orig"                                                                                                                                                      >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "								echo \"  [ Renaming newly deduped temp, to original ... ]\""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "								mv \"\${filespec_DedupedTempCopy}\" \"\${filespec_OrigToDedup}\"  ## FILESYSTEM CHANGE"                                                                                                                    >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "								if [ -f \"\${filespec_DedupedTempCopy}\" ] || [ ! -f  \"\${filespec_OrigToDedup}\" ]; then"                                                                                          >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "									fThrowError \"\${funcName}: CRITICAL!: Could not rename deduped temp copy back to orig '\${filespec_OrigToDedup}'. [#1140]\""                                                    >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "								else"                                                                                                                                                                                >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "									## Delete 'to-delete' original"                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "									echo \"  [ Deleting space-hogging *.\${ext_OrigToDelete} file ... ]\""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "									startTime=\$(date \"+%Y%m%d%H%M%S\")"                                                                                                                                                                >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "									\rm \"\${filespec_OrigTempToDelete}\"  ## FILESYSTEM CHANGE"                                                                                                                                           >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "									endTime=\$(date \"+%Y%m%d%H%M%S\")"                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "									et_rm=\$((endTime-startTime))"                                                                                                                                                                     >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "									echo \"  ET to remove space hog .....: \${et_rm}\""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "									if [ -f \"\${filespec_OrigTempToDelete}\" ]; then"                                                                                                                               >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "										fThrowError \"\${funcName}: 'to-delete' intermediate temp still exists: '\${filespec_OrigTempToDelete}'. [#1150]\""                                                          >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "									else"                                                                                                                                                                            >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "										## Echo one-line success output"                                                                                                                                             >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "										echo \"  [ Success. ]\""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "										echo"                                                                                                                                                                        >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "									fi"                                                                                                                                                                              >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "								fi"                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "							fi"                                                                                                                                                                                      >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "						fi"                                                                                                                                                                                          >> "./rmlint_do-dedup_custom-subroutine.sh"
+if [ ${doCheckForOpenFiles} -eq 1 ]; then
+	echo "					fi"                                                                                                                                                                                              >> "./rmlint_do-dedup_custom-subroutine.sh"
+fi
+	echo "				fi"                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+if [ ${doCheckForOpenFiles} -eq 1 ]; then
+	echo "			fi"                                                                                                                                                                                                      >> "./rmlint_do-dedup_custom-subroutine.sh"
+fi
+	echo "		fi"                                                                                                                                                                                                          >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	fi"                                                                                                                                                                                                              >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "}"                                                                                                                                                                                                                 >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "function fGetValidTempFilespec(){"                                                                                                                                                                           >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	"                                                                                                                                                                                                                >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	## Constants"                                                                                                                                                                                                    >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	local -r funcName=\"\$(basename \"\$0\").fGetValidTempFilespec()\""                                                                                                                                                                              >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	## Args"                                                                                                                                                                                                         >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	local -r outputExt=\"\$1\""                                                                                                                                                                                      >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	## Variables"                                                                                                                                                                                                    >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	local filespec_Output=\"\""                                                                                                                                                                                      >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	if [ -z \"\${filespec_OrigToDedup}\" ]; then"                                                                                                                                                                        >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "		fThrowError \"\${funcName}: A filespec must be provided, for which a new random temp filespec will be based on. [#020]\""                                                                                    >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	elif [ -z \"\${outputExt}\" ]; then"                                                                                                                                                                             >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "		fThrowError \"\${funcName}: An output name extension must be provided. [#030]\""                                                                                                                             >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	elif [ ! -f \"\${filespec_OrigToDedup}\" ]; then"                                                                                                                                                                      >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "		echo \"FYI: \${funcName}: Isn't a file or doesn't exist: '\${filespec_OrigToDedup}', skipping. [#080]\""                                                                                                           >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	else"                                                                                                                                                                                                            >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "		filespec_Output=\"\${filespec_OrigToDedup}.\$(date \"+%Y%m%d-%H%M%S\")-\$(cat /dev/urandom 2>/dev/null | tr -dc 'a-z0-9' 2>/dev/null | fold -w 4 2>/dev/null | head -n 1 2>/dev/null || true).\${outputExt}\""     >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "		if [ -z \"\${filespec_Output}\" ]; then"                                                                                                                                                                     >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "			fThrowError \"\${funcName}: Code problem: variable 'filespec_Output' is unexpectedly empty. [#040]\""                                                                                                    >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "		elif [ -z \"\$(dirname \"\${filespec_Output}\" 2>/dev/null || true)\" ]; then"                                                                                                                               >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "			fThrowError \"\${funcName}: dirname for '\${filespec_Output}' can't be empty. [#050]\""                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "		elif [ -f \"\${filespec_Output}\" ]; then"                                                                                                                                                                   >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "			fThrowError \"Temporary filespec '\${filespec_Output}' already exists, but shouldn't. [#060]\""                                                                                                          >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "		elif [ ! -d \"\$(dirname \"\${filespec_Output}\" 2>/dev/null || true)\" ]; then"                                                                                                                             >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "			echo \"FYI: \${funcName}: Directory doesn't exist for '\${filespec_Output}', skipping. [#070]\""                                                                                                         >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "			filespec_Output=\"\""                                                                                                                                                                                    >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "		fi"                                                                                                                                                                                                          >> "./rmlint_do-dedup_custom-subroutine.sh"
+#	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+#	echo "		## Debug"                                                                                                                                                                                                    >> "./rmlint_do-dedup_custom-subroutine.sh"
+#	echo "		echo \"DEBUG - \${funcName}:\""                                                                                                                                                                              >> "./rmlint_do-dedup_custom-subroutine.sh"
+#	echo "		echo \"Input ....: '\${filespec_OrigToDedup}'\""                                                                                                                                                                   >> "./rmlint_do-dedup_custom-subroutine.sh"
+#	echo "		echo \"Tmp ext ..: '\${outputExt}'\""                                                                                                                                                                        >> "./rmlint_do-dedup_custom-subroutine.sh"
+#	echo "		echo \"Output ...: '\${filespec_Output}'\""                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "		## Set return value"                                                                                                                                                                                         >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "		prop_fGetValidTempFilespec_result=\"\${filespec_Output}\""                                                                                                                                                              >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	fi"                                                                                                                                                                                                              >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "}"                                                                                                                                                                                                                 >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "function fThrowError(){"                                                                                                                                                                                           >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	local errMsg=\"\$@\""                                                                                                                                                                                            >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	if [ -z \"\${errMsg}\" ]; then errMsg=\"An error occurred.\"; fi"                                                                                                                                                >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	echo; echo \"\${errMsg}\"; echo"                                                                                                                                                                                 >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "	exit 1"                                                                                                                                                                                                          >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "}"                                                                                                                                                                                                                 >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "set -e"                                                                                                                                                                                                            >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "set -E"                                                                                                                                                                                                            >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo "fMain \"\$1\" \"\$2\" \"\$3\" \"\$4\" \"\$5\" \"\$6\" \"\$7\" \"\$8\" \"\$9\""                                                                                                                                     >> "./rmlint_do-dedup_custom-subroutine.sh"
+	echo ""                                                                                                                                                                                                                  >> "./rmlint_do-dedup_custom-subroutine.sh"
+	
+	chmod +x "./rmlint_do-dedup_custom-subroutine.sh"
+}
+
+
+function fCreateScript_ShowRealtimeStatus(){
+	##	History
+	##		- 20190826 JC: Created.
+
+	## Also make a script called by this script
+	local subScript="$(mktemp)"
+
+
+	## Create the main script
+	touch                 "${tmpScript_ShowRealtimeStatus}"
+	echo "#!/bin/bash" >  "${tmpScript_ShowRealtimeStatus}"
+
+	echo "set -e; set -E"                                                                        >> "${tmpScript_ShowRealtimeStatus}"
+	echo ""                                                                                      >> "${tmpScript_ShowRealtimeStatus}"
+	echo "echo"                                                                                  >> "${tmpScript_ShowRealtimeStatus}"
+	echo "echo \"[ Verifying root ... ]\""                                                       >> "${tmpScript_ShowRealtimeStatus}"
+	echo "sudo echo \"[ Root verified. ]\""                                                      >> "${tmpScript_ShowRealtimeStatus}"
+	echo "echo"                                                                                  >> "${tmpScript_ShowRealtimeStatus}"
+	echo ""                                                                                      >> "${tmpScript_ShowRealtimeStatus}"
+	echo "## Clear out spacestats log that shouldn't even exist, in case it does."               >> "${tmpScript_ShowRealtimeStatus}"
+	echo "if [ -f \"${tmpFilespec_origSpaceStats}.bak\" ]; then"                                 >> "${tmpScript_ShowRealtimeStatus}"
+	echo "	sudo \rm \"${tmpFilespec_origSpaceStats}.bak\""                                      >> "${tmpScript_ShowRealtimeStatus}"
+	echo "fi"                                                                                    >> "${tmpScript_ShowRealtimeStatus}"
+	echo "if [ -f \"${tmpFilespec_origSpaceStats}\" ]; then"                                     >> "${tmpScript_ShowRealtimeStatus}"
+	echo "	sudo mv \"${tmpFilespec_origSpaceStats}\" \"${tmpFilespec_origSpaceStats}.bak\""     >> "${tmpScript_ShowRealtimeStatus}"
+	echo "fi"                                                                                    >> "${tmpScript_ShowRealtimeStatus}"
+	echo ""                                                                                      >> "${tmpScript_ShowRealtimeStatus}"
+	echo "## Call stats script periodically (which, BTW, manages spacestats log file)"           >> "${tmpScript_ShowRealtimeStatus}"
+#	echo "sudo watch -n 10 -d \"${subScript}\""                                                  >> "${tmpScript_ShowRealtimeStatus}"
+	echo "sudo watch -n ${realtimeStatsUpdateIntervalSecs} \"${subScript}\""                     >> "${tmpScript_ShowRealtimeStatus}"
+
+	chmod +x "${tmpScript_ShowRealtimeStatus}"
+
+
+	## Create the sub script
+	##TODO: Much of this logic is redundant with fEchoAndLog_FreeSpace().
+	touch                 "${subScript}"
+	echo "#!/bin/bash" >  "${subScript}"
+
+	echo ""                                                                                                                                                                                                                   >> "${subScript}"
+	echo "function fMain(){"                                                                                                                                                                                                  >> "${subScript}"
+	echo ""                                                                                                                                                                                                                   >> "${subScript}"
+	echo "	## Constants"                                                                                                                                                                                                     >> "${subScript}"
+	echo "	local -r dir_Output=\"${workingDir_BaseLevel2}\""                                                                                                                                                                 >> "${subScript}"
+	echo "	local -r dir_DedupeTarget=\"${dirToDedupe}\""                                                                                                                                                                     >> "${subScript}"
+	echo "	local -r file_log=\"${filespec_Log}\""                                                                                                                                                                            >> "${subScript}"
+	echo "	local -r file_RmlintSh=\"${filespec_Script_rmlint_pass2}\""                                                                                                                                                       >> "${subScript}"
+	echo "	local -r typeFS=\"${fsType}\""                                                                                                                                                                                    >> "${subScript}"
+	echo "	local -r zPool=\"${zfsPoolName}\""                                                                                                                                                                                >> "${subScript}"
+	echo ""                                                                                                                                                                                                                   >> "${subScript}"
+	echo "	## Get current space stats"                                                                                                                                                                                       >> "${subScript}"
+	echo "	local -r spaceStats=\"\$(fGetSpaceStats)\""                                                                                                                                                                       >> "${subScript}"
+	echo ""                                                                                                                                                                                                                   >> "${subScript}"
+	echo "	## Save orig space stats"                                                                                                                                                                                         >> "${subScript}"
+	echo "	if [ ! -f \"${tmpFilespec_origSpaceStats}\" ]; then"                                                                                                                                                              >> "${subScript}"
+	echo "		echo -e \"\${spaceStats}\" > \"${tmpFilespec_origSpaceStats}\""                                                                                                                                               >> "${subScript}"
+	echo "	fi"                                                                                                                                                                                                               >> "${subScript}"
+	echo ""                                                                                                                                                                                                                   >> "${subScript}"
+	echo "	## Show orig space stats"                                                                                                                                                                                         >> "${subScript}"
+	echo "	if [ -f \"${tmpFilespec_origSpaceStats}\" ]; then"                                                                                                                                                                >> "${subScript}"
+	echo "		echo \"Original space stats:\""                                                                                                                                                                               >> "${subScript}"
+	echo "		echo"                                                                                                                                                                                                         >> "${subScript}"
+	echo "		cat \"${tmpFilespec_origSpaceStats}\""                                                                                                                                                                        >> "${subScript}"
+	echo "	fi"                                                                                                                                                                                                               >> "${subScript}"
+	echo ""                                                                                                                                                                                                                   >> "${subScript}"
+	echo "	## Show current space stats"                                                                                                                                                                                      >> "${subScript}"
+	echo "	echo"                                                                                                                                                                                                             >> "${subScript}"
+	echo "	echo \"Current space stats:\""                                                                                                                                                                                    >> "${subScript}"
+	echo "	echo"                                                                                                                                                                                                             >> "${subScript}"
+	echo "	echo -e \"\${spaceStats}\""                                                                                                                                                                                       >> "${subScript}"
+	echo ""                                                                                                                                                                                                                   >> "${subScript}"
+	echo "	## Tail logs"                                                                                                                                                                                                     >> "${subScript}"
+	echo "	echo"                                                                                                                                                                                                             >> "${subScript}"
+	echo "	if [ ! -d \"\${dir_Output}\" ]; then"                                                                                                                                                                             >> "${subScript}"
+	echo "		echo \"Waiting for log directory to be created.\""                                                                                                                                                            >> "${subScript}"
+	echo "	else"                                                                                                                                                                                                             >> "${subScript}"
+	echo "		cd \"\${dir_Output}\""                                                                                                                                                                                        >> "${subScript}"
+	echo "		if [ -f \"\${file_log}\" ]; then"                                                                                                                                                                             >> "${subScript}"
+	echo "			echo \"Last 20 lines of '\${file_log}':\""                                                                                                                                                                >> "${subScript}"
+	echo "			echo"                                                                                                                                                                                                     >> "${subScript}"
+	echo "			tail -n 20 \"\${file_log}\" | fIndent_nopre 2"                                                                                                                                                            >> "${subScript}"
+	echo "		elif [ -f \"\${file_RmlintSh}\" ]; then"                                                                                                                                                                      >> "${subScript}"
+	echo "			## Shouldn't actually get here anymore"                                                                                                                                                                   >> "${subScript}"
+	echo "			echo \"Last 20 lines of '\${file_RmlintSh}':\""                                                                                                                                                           >> "${subScript}"
+	echo "			echo"                                                                                                                                                                                                     >> "${subScript}"
+	echo "			tail -n 20 \"\${file_RmlintSh}\" | fIndent_nopre 2"                                                                                                                                                       >> "${subScript}"
+	echo "		fi"                                                                                                                                                                                                           >> "${subScript}"
+	echo "	fi"                                                                                                                                                                                                               >> "${subScript}"
+	echo ""                                                                                                                                                                                                                   >> "${subScript}"
+	echo "}"                                                                                                                                                                                                                  >> "${subScript}"
+	echo ""                                                                                                                                                                                                                   >> "${subScript}"
+	echo "function fGetSpaceStats(){"                                                                                                                                                                                         >> "${subScript}"
+	echo ""                                                                                                                                                                                                                   >> "${subScript}"
+	echo "	local outputStr=\"\""                                                                                                                                                                                             >> "${subScript}"
+	echo ""                                                                                                                                                                                                                   >> "${subScript}"
+	echo "	## FS-specific free space calculations"                                                                                                                                                                           >> "${subScript}"
+	echo "	local tmpStr=\"\""                                                                                                                                                                                                >> "${subScript}"
+	echo "	case \"\${typeFS}\" in"                                                                                                                                                                                           >> "${subScript}"
+	echo ""                                                                                                                                                                                                                   >> "${subScript}"
+	echo "		\"btrfs\")"                                                                                                                                                                                                   >> "${subScript}"
+	echo "			tmpStr=\"\""                                                                                                                                                                                              >> "${subScript}"
+	echo "			tmpStr=\"\$(btrfs fi usage \"\${dir_DedupeTarget}\" 2>/dev/null | grep -iE 'Device (size|allocated):|  Used:|Free \(estimated\):' 2>/dev/null  | column -t -s \$'\t' | fIndent 2 2>/dev/null || true)\""  >> "${subScript}"
+	echo "			if [ -n \"\${tmpStr}\" ]; then"                                                                                                                                                                           >> "${subScript}"
+	echo "				if [ -n \"\${outputStr}\" ]; then outputStr=\"\${outputStr}\\n\\n\"; fi"                                                                                                                              >> "${subScript}"
+	echo "				outputStr=\"\${outputStr}\${tmpStr}\""                                                                                                                                                                >> "${subScript}"
+	echo "			fi"                                                                                                                                                                                                       >> "${subScript}"
+	echo "			;;"                                                                                                                                                                                                       >> "${subScript}"
+	echo ""                                                                                                                                                                                                                   >> "${subScript}"
+	echo "		\"zfs\")"                                                                                                                                                                                                     >> "${subScript}"
+	echo "			tmpStr=\"\""                                                                                                                                                                                              >> "${subScript}"
+	echo "			tmpStr=\"\$(zpool list \${zPool} 2>/dev/null | fIndent 2 || true)\""                                                                                                                                      >> "${subScript}"
+	echo "			if [ -n \"\${tmpStr}\" ]; then"                                                                                                                                                                           >> "${subScript}"
+	echo "				if [ -n \"\${outputStr}\" ]; then outputStr=\"\${outputStr}\\n\\n\"; fi"                                                                                                                              >> "${subScript}"
+	echo "				outputStr=\"\${outputStr}\${tmpStr}\""                                                                                                                                                                >> "${subScript}"
+	echo "			fi"                                                                                                                                                                                                       >> "${subScript}"
+	echo "			tmpStr=\"\""                                                                                                                                                                                              >> "${subScript}"
+	echo "			tmpStr=\"\$(zfs get all \${zPool} 2>/dev/null | grep -iE \"${zfsGetGrep}\" 2>/dev/null | fIndent 2 || true)\""                                                                               >> "${subScript}"
+	echo "			if [ -n \"\${tmpStr}\" ]; then"                                                                                                                                                                           >> "${subScript}"
+	echo "				if [ -n \"\${outputStr}\" ]; then outputStr=\"\${outputStr}\\n\\n\"; fi"                                                                                                                              >> "${subScript}"
+	echo "				outputStr=\"\${outputStr}\${tmpStr}\""                                                                                                                                                                >> "${subScript}"
+	echo "			fi"                                                                                                                                                                                                       >> "${subScript}"
+	echo "			;;"                                                                                                                                                                                                       >> "${subScript}"
+	echo ""                                                                                                                                                                                                                   >> "${subScript}"
+	echo "	esac"                                                                                                                                                                                                             >> "${subScript}"
+	echo ""                                                                                                                                                                                                                   >> "${subScript}"
+	echo "	## Generic free space calculation"                                                                                                                                                                                >> "${subScript}"
+	echo "	tmpStr=\"\""                                                                                                                                                                                                      >> "${subScript}"
+	echo "	tmpStr=\"\$(df -h \"\${dir_DedupeTarget}\" 2>/dev/null | fIndent 2 || true)\""                                                                                                                                    >> "${subScript}"
+	echo "	if [ -n \"\${tmpStr}\" ]; then"                                                                                                                                                                                   >> "${subScript}"
+	echo "		if [ -n \"\${outputStr}\" ]; then outputStr=\"\${outputStr}\\n\\n\"; fi"                                                                                                                                      >> "${subScript}"
+	echo "		outputStr=\"\${outputStr}\${tmpStr}\""                                                                                                                                                                        >> "${subScript}"
+	echo "	fi"                                                                                                                                                                                                               >> "${subScript}"
+	echo ""                                                                                                                                                                                                                   >> "${subScript}"
+	echo "	echo \"\${outputStr}\""                                                                                                                                                                                           >> "${subScript}"
+	echo ""                                                                                                                                                                                                                   >> "${subScript}"
+	echo "}"                                                                                                                                                                                                                  >> "${subScript}"
+	echo ""                                                                                                                                                                                                                   >> "${subScript}"
+	echo "function fIndent(){ sed -e 's/^[ \\t]*//' | sed \"s/^/\$(printf \"%\${1}s\")/\"; }"                                                                                                                                 >> "${subScript}"
+	echo "function fIndent_nopre(){ sed \"s/^/\$(printf \"%\${1}s\")/\"; }"                                                                                                                                                   >> "${subScript}"
+	echo ""                                                                                                                                                                                                                   >> "${subScript}"
+	echo "set -e"                                                                                                                                                                                                             >> "${subScript}"
+	echo "set -E"                                                                                                                                                                                                             >> "${subScript}"
+	echo "fMain"                                                                                                                                                                                                              >> "${subScript}"
+
+	chmod +x "${subScript}"
+
+}
+
+
+function fIndent(){
+	##	History:
+	##		- 20190903 JC: Created.
+	sed -e 's/^[ \t]*//' | sed "s/^/$(printf "%${1}s")/"
+#	sed -e 's/^[ \t]*//' | sed 's/^/    /'
+#	sed -e 's/^[ \t]*//' | awk '{printf "%\${1}s", " "}'
+}
+
+
+function fCreateScript_ShowPotentiallyHarmfulCommands(){
+	##	History
+	##		- 20190826 JC: Created
+
+	## Create the sub script
+	touch                 "${tmpScript_ShowPotentiallyHarmfulCommands}"
+	echo "#!/bin/bash" >  "${tmpScript_ShowPotentiallyHarmfulCommands}"
+
+	echo    "set -e; set -E"                                                      >> "${tmpScript_ShowPotentiallyHarmfulCommands}"
+	echo    ""                                                                    >> "${tmpScript_ShowPotentiallyHarmfulCommands}"
+	echo    "cd \"${workingDir_BaseLevel2}\""                                     >> "${tmpScript_ShowPotentiallyHarmfulCommands}"
+	echo -n "cat \"${filespec_Script_rmlint_pass2}\""                             >> "${tmpScript_ShowPotentiallyHarmfulCommands}"
+	echo -n     "| grep -iE \"/mnt/btrfs/array-f7\" "                             >> "${tmpScript_ShowPotentiallyHarmfulCommands}"
+	echo -n     "| grep -iEv \"clone |original_cmd |skip_reflink |rmlint \" "     >> "${tmpScript_ShowPotentiallyHarmfulCommands}"
+	echo        "| less"                                                          >> "${tmpScript_ShowPotentiallyHarmfulCommands}"
+
+	chmod +x "${tmpScript_ShowPotentiallyHarmfulCommands}"
+
+}
+
+
+function fCreateFile_Help(){
+	##	History
+	##		- 20190826 JC: Created
+
+	touch "${filespec_Help}"
+
+	echo "Pass 1 command (${output_desc_Pass1}):"                                         >  "${filespec_Help}"
+	echo "    rmlint \"${dirToDedupe}\" ${optsPass1_Useful}"                              >> "${filespec_Help}"
+	echo                                                                                  >> "${filespec_Help}"
+	echo "Pass 2 (${output_desc_Pass2}):"                                                 >> "${filespec_Help}"
+	echo "    ${filespec_Script_rmlint_pass2}"                                            >> "${filespec_Help}"
+	echo                                                                                  >> "${filespec_Help}"
+	echo "Command to show output in real-time:"                                           >> "${filespec_Help}"
+	echo "    ${tmpScript_ShowRealtimeStatus}"                                            >> "${filespec_Help}"
+	echo                                                                                  >> "${filespec_Help}"
+	echo "Command to show potentially unsafe commands that might be run in step 2:"       >> "${filespec_Help}"
+	echo "    ${tmpScript_ShowPotentiallyHarmfulCommands}"                                >> "${filespec_Help}"
+	echo                                                                                  >> "${filespec_Help}"
+	echo "Log file:"                                                                      >> "${filespec_Help}"
+	echo "    ${filespec_Log}"                                                            >> "${filespec_Help}"
+
+}
+
+
+function fEchoVarAndVal(){
+	##	History
+	##		- 20190826 JC: Created.
+	local -r varName="$1"
+	echo "${varName} = '${!varName}'"
+}
+
+
+function fStrTrim(){
+	##	History
+	##		- 20190826 JC: Created by copying from 0_library_v2.
+	local inputStr="$@"
+	if [ -n "${inputStr}" ]; then
+		outputStr="$(echo -e "${inputStr}" | sed 's/^[[:blank:]]*//;s/[[:blank:]]*$//' 2>/dev/null || true)"  ## Strip of leading and trailing spaces or tabs.
+	fi
+	echo -n "${outputStr}"
+}
+
+
+function fStrNormalize() {
+	##	Purpose:
+	##		- Strips leading and trailing spaces from string.
+	##		- Changes all whitespace inside a string to single spaces.
+	##	References:
+	##		- https://unix.stackexchange.com/a/205854
+	##	History
+	##		- 20190701 JC: Created
+	##		- 20190724 JC: Didn't work on newlines. Fixed.
+	local argStr="$@"
+	argStr="${argStr//$'\n'/ }"  ## Convert newlines to spaces
+	argStr="${argStr//$'\t'/ }"  ## Convert tabs to spaces
+	argStr="$(echo "${argStr}" | awk '{$1=$1};1' 2>/dev/null || true)"  ## Collapse multiple spaces to one and trim
+	echo "${argStr}"
+}
+
+
+function fstrAppend(){
+	##	History
+	##		- 20190826 JC: Created by copying from 0_library_v2.
+
+	## Args
+	local -r variableName="$1"
+	local -r appendFirstIfExistingNotEmpty="$2"
+	local -r appendStr="$3"
+
+	## Variables
+	local valStr="${!variableName}"
+
+	## Append to variable who's name is stored in $variableName
+	if [ -n "${valStr}" ]; then valStr="${valStr}${appendFirstIfExistingNotEmpty}"; fi
+	valStr="${valStr}${appendStr}"
+	eval "${variableName}=\"${valStr}\""
+
+}
+
+
+function fNormalizePath_byref(){ :;
+	##	Purpose:
+	##		- Given a variable name, strips leading and trailing spaces from its contents.
+	##		- Strips ending slash from string.
+	##			- So your code knows exactly the status of ending slash and can go from there.
+	##		- Converts multiple instances of path separators, to only one.
+	##	History
+	##		- 20190826 JC: Created by copying from 0_library_v2.
+	local -r funcName="$(basename "$0").fGetFsType()"
+	local -r varName="$1"
+	local returnStr=""
+	if [ -z "${varName}" ]; then
+		fThrowError "${funcName}: No variable name specified."
+	else
+		local -r varVal="${!varName}"
+		returnStr="${varVal}"
+		local loop_PreviousStr=""
+		while [ "${returnStr}" != "${loop_PreviousStr}" ]; do
+			loop_PreviousStr="${returnStr}"
+			returnStr=${returnStr//$'\n'/ } #............................................................. Replace newlines
+			returnStr=${returnStr//$'\t'/ } #............................................................. Replace tabs with spaces
+			returnStr="$(echo "${returnStr}" | sed 's#\\#/#g' 2>/dev/null || true)" #.................... Convert backslashes to forward slashes
+			returnStr="$(echo "${returnStr}" | sed 's#/ #/#g' | sed 's# /#/#g' 2>/dev/null || true)" #... Remove space before and after slashes
+			returnStr="$(echo "${returnStr}" | tr -s "/" 2>/dev/null || true)" #......................... Convert multiple slashes into one
+			returnStr="${returnStr%/}" #.................................................................. Trim trailing slash
+			returnStr="$(fStrTrim "${returnStr}")" #...................................................... Trim leading and trailing whitespace
+		done
+		eval "${varName}=\"${returnStr}\""
+	fi
+}
+
+
+function fMustBeInPath(){
+	local -r programToCheckForInPath="$1"
+	if [ -z "${programToCheckForInPath}" ]; then
+		fThrowError "fMustBeInPath(): Not program specified."
+	elif [ -z "$(which ${programToCheckForInPath} 2>/dev/null || true)" ]; then
+		fThrowError "Not found in path: ${programToCheckForInPath}"
+	fi
+}
+
+
+##	Echo-related stuff.
+##	History
+##		- 20190826 JC: Created by copying from 0_library_v2.
+declare vmbLastEchoWasBlank="false"
+function fEcho_Clean(){
+	if [ -n "$1" ]; then
+		local -i vliColumns=$(tput cols)
+		echo -e "$@" | fold -s -w $vliColumns
+		vmbLastEchoWasBlank="false"
+	else
+		if [ "${vmbLastEchoWasBlank}" != "true" ]; then :;
+			echo
+		fi
+		vmbLastEchoWasBlank="true"
+	fi
+}
+function fEcho_ResetBlankCounter(){ vmbLastEchoWasBlank="false"; }
+function fEcho(){ if [ -n "$1" ]; then fEcho_Clean "[ $@ ]"; else fEcho_Clean ""; fi; }
+function fEcho_Force(){ fEcho_ResetBlankCounter; fEcho "$@"; }
+
+##	Errorhandling.
+##	History
+##		- 20190826 JC: Created by copying from 0_library_v2.
+function fThrowError(){
+	##	History
+	##		- 20190826 JC: Created
+	local errMsg="$@"
+	if [ -z "${errMsg}" ]; then errMsg="An error occurred."; fi
+	fEcho_Clean
+	fEcho_Clean "${errMsg}"
+	exit 1
+}
+function _fTrap_Exit(){
+	if [ "${wasCleanupRun}" == "0" ]; then  ## String compare is less to fail than integer
+		wasCleanupRun=1
+		_fSingleExitPoint "$@"
+	fi
+}
+function _fTrap_Error(){
+	if [ "${wasCleanupRun}" == "0" ]; then  ## String compare is less to fail than integer
+		wasCleanupRun=1
+		_fSingleExitPoint "$@"
+	fi
+} 
+function _fSingleExitPoint(){
+	##	History
+	##		- 20190828 JC: Created
+	local -r signal="$1"; shift || true
+	local -r lineNum="$1"; shift || true
+	local -r errNum="$1"; shift || true
+	local -r errMsg="$@"
+	if [ "${signal}" == "INT" ]; then
+		fEcho_Clean
+		fEcho_Clean "User interrupted."
+		fEcho_Clean
+	elif [ "${errNum}" != "0" ] && [ "${errNum}" != "1" ]; then  ## Clunky string compare is less likely to fail than integer
+		fEcho_Clean
+		fEcho_Clean "Signal .....: '${signal}'"
+		fEcho_Clean "Err# .......: '${errNum}'"
+		fEcho_Clean "Error ......: '${errMsg}'"
+		fEcho_Clean "At line# ...: '${lineNum}'"
+		fEcho_Clean
+	fi
+	## User cleanup
+	fCleanup
+}
+declare -i wasCleanupRun=0
+set -e
+set -E
+trap '_fTrap_Error ERR     ${LINENO} $? $_' ERR
+trap '_fTrap_Error SIGHUP  ${LINENO} $? $_' SIGHUP
+trap '_fTrap_Error SIGINT  ${LINENO} $? $_' SIGINT    ## CTRL+C
+trap '_fTrap_Error SIGTERM ${LINENO} $? $_' SIGTERM
+trap '_fTrap_Exit  EXIT    ${LINENO} $? $_' EXIT
+trap '_fTrap_Exit  INT     ${LINENO} $? $_' INT
+trap '_fTrap_Exit  TERM    ${LINENO} $? $_' TERM
+
+
+## Run fMain
+fMain "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9"
