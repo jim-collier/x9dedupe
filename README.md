@@ -1,4 +1,13 @@
-# alldedup
+# alldedup<!-- omit in TOC -->
+
+## Table of contents<!-- omit in TOC -->
+
+- [Overview](#overview)
+- [Footnotes](#footnotes)
+- [To-do](#to-do)
+
+## Overview
+
 The first and so far only ZFS offline deduplication tool. Can also efficiently deduplicate Btrfs and XFS.
 
 Currently relies partially on [rmlint](https://github.com/sahib/rmlint), though a planned binary version will remove external dependencies.
@@ -15,6 +24,11 @@ Deduplicates the specified directory and below, via one of three explicit option
 - Simplifies and extends 'rmlint', tested as the fastest, most robust, and well-maintained dedup utility. Git page: https://github.com/sahib/rmlint/
 - Requires a recent version of rmlint, from v2.8.0 master branch, v2.9.0 release branch, or higher. v2.9.0 was released on 2019-08-20.
 
-Notes:
+## Footnotes
 
 ¹ Features provided through [rmlint](https://github.com/sahib/rmlint).
+
+## To-do
+
+- [ ] Test with latest master version of [rmlint](https://github.com/sahib/rmlint).
+- [ ] Start C++ version with no external dependencies (other than statically compiled libraries like sqlite3).
