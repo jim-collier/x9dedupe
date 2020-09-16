@@ -31,4 +31,9 @@ Deduplicates the specified directory and below, via one of three explicit option
 ## To-do
 
 - [ ] Test with latest master version of [rmlint](https://github.com/sahib/rmlint).
-- [ ] Start C++ version with no external dependencies (other than statically compiled libraries like sqlite3).
+- [x] Start C++ version with no external dependencies (other than statically linked libraries like sqlite3).
+  - After a start, decided against C++. Too much cognitive overhead. For pure static binaries, Rust would be a better choice (or better yet, Go).
+- [ ] Start C# version with no dependencies other than sqlite3.
+  - Because I'm significantly more fluent in C# than C++, and with dotnet core 3.1, it has come a long way.
+    - C# is still not perfect in terms of producing a single small exe with no dependencies. Either the dotnet runtime has to already be installed, or it's bundled with every exe and is extracted before running.
+    - Another problem: the default sqlite3 ADO provider is currently broken when compiling a single binary, due to conflicting paths. This will likely be fixed at some point in the future. For now, using a single-file C# wrapper (sqlite-net).
