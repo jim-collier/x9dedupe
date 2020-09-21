@@ -1,6 +1,14 @@
 #!/bin/bash
+# shellcheck disable=2004  ## Inappropriate complaining of "$/${} is unnecessary on arithmetic variables."
+# shellcheck disable=2034  ## Unused variables.
+# shellcheck disable=2119  ## Disable confusing and inapplicable warning about function's $1 meaning script's $1.
+# shellcheck disable=2155  ## Disable check to 'Declare and assign separately to avoid masking return values'.
+# shellcheck disable=2120  ## OK with declaring variables that accept arguments, without calling with arguments (this is 'overloading').
 
-#########################################################################################
+##
+##	WARNING: This script is maintained on github. Don't edit directly. https://github.com/jim-collier/x9dedupe
+##
+
 ##	Purpose .....: See fPrint_About()
 ##	Arguments ...: See fPrint_Syntax()
 ##	Modifies:
@@ -36,6 +44,38 @@
 ##		License GPLv3+: GNU GPL version 3 or later, full text at:
 ##		    https://www.gnu.org/licenses/gpl-3.0.en.html
 ##		There is no warranty, to the extent permitted by law.
+##	TODO:
+##		- For status script generation: Use heredoc format rather than per-line echo/redirect. E.g.:
+##			command <<-EOF > outputfile
+##				Any text
+##			EOF
+##		- Code cleanup:
+##			- Rename stuff like local -r funcName="$(basename "$0").fMain()" to "${meName}.${FUNCNAME[0]}"
+##			- Put in latest template wrapper, mainly for 'cheap' access to profiling.
+##		- Create a status file in /tmp that calling scripts can check (last instance of), e.g. with fields:
+##			status_dedup_pass1_val=wip|done|notstarted|error
+##			status_dedup_pass1_updated=yyyymmdd-hhmmss
+##			status_dedup_pass2_val=wip|done|notstarted|error
+##			status_dedup_pass2_updated=yyyymmdd-hhmmss
+##			status_dedup_pass2_sub_val=wip|done|notstarted|error
+##			status_dedup_pass2_sub_updated=yyyymmdd-hhmmss
+##			status_zfs_prop_dedup_restored_val=na|notyet|yes
+##			status_zfs_prop_dedup_restored_updated=yyyymmdd-hhmmss
+##		- Catch 'exit' event, and:
+##			- Delete stuff in /tmp
+##			- Update status file
+##			- Reset zfs dedup property
+##		- Throw error if spaces in rmlint filespec arguments.
+##			- And also, double-check to see if this is really necessary, why, and how to fix it rather than working around it.
+##		- Get opening realtime output in another terminal window working.
+##		- Add flag: --clear-rmlint-xattrs.
+##		y Store output of fs space to file, keep showing it in status script.
+##		y Launch stats in a new terminal?
+##		y For 'recopy':
+##			y Make sure complete xattrs get copied, including rmlint 'duplicate of' attributes.
+##			n If not, need to copy these [x]attrs in fCreateScript_Recopy().
+##			n Consider writing own xattrs for incremental recopy.
+##			y Make sure metadata including correct time/date gets copied [verified yes].
 ##	History:
 ##		- 20190124 JC: Created.
 ##		- 20190724 JC:
@@ -67,30 +107,9 @@
 ##					- https://github.com/sahib/rmlint/issues/349
 ##				- Also might file an issue about converting from hardlinks to reflinks failing with errors. (Still no data loss though.)
 ##		- 20191014 JC: Renamed from j.* to x9*
-##	TODO:
-##		y For 'recopy':
-##			y Make sure complete xattrs get copied, including rmlint 'duplicate of' attributes.
-##			n If not, need to copy these [x]attrs in fCreateScript_Recopy().
-##			n Consider writing own xattrs for incremental recopy.
-##			y Make sure metadata including correct time/date gets copied [verified yes].
-##		- Create a status file in /tmp that calling scripts can check (last instance of), e.g. with fields:
-##			status_dedup_pass1_val=wip|done|notstarted|error
-##			status_dedup_pass1_updated=yyyymmdd-hhmmss
-##			status_dedup_pass2_val=wip|done|notstarted|error
-##			status_dedup_pass2_updated=yyyymmdd-hhmmss
-##			status_dedup_pass2_sub_val=wip|done|notstarted|error
-##			status_dedup_pass2_sub_updated=yyyymmdd-hhmmss
-##			status_zfs_prop_dedup_restored_val=na|notyet|yes
-##			status_zfs_prop_dedup_restored_updated=yyyymmdd-hhmmss
-##		- Catch 'exit' event, and:
-##			- Delete stuff in /tmp
-##			- Update status file
-##			- Reset zfs dedup property
-##		- Throw error if spaces in rmlint any filespec arguments.
-##		- Get opening realtime output in another terminal window working.
-##		- Add flag: --clear-rmlint-xattrs.
-##		y Store output of fs space to file, keep showing it in status script.
-##		y Launch stats in a new terminal?
+##		- 20200921 JC:
+##			- Added linter excludes.
+##			- Minor cleanup.
 
 
 ## User-adjustable constants
@@ -98,11 +117,10 @@ declare -r baseLogDirUnderUserHome="var/log" #..................... No beginning
 declare -r versionExpected_Rmlint="2.(8|9|[1-9][0-9]+).[0-9]+" #... Regex
 
 ## Global constants
-declare -r thisVersion="20190827"
+declare -r thisVersion="0.9.0"
 declare -r fsTypesThatSupport_Clone="btrfs|xfs"
 declare -r fsTypesThatSupport_Recopy="zfs"
 declare -r realtimeStatsUpdateIntervalSecs=10
-
 
 function fPrint_About(){
 	fEcho_Clean ""
@@ -195,8 +213,6 @@ function fMain(){
 	local -r funcName="$(basename "$0").fMain()"
 
 	## Args
-#	local -r arg_Flag="$1"
-#	local -r arg_dirToDedupe="$2"
 	local -r allArgs="$(echo $@)"
 
 	## Validate 1 of 4; dependencies (rmlint is checked later; existence of echo, true, which, /dev/null, and /dev/urandom are assumed)
@@ -1302,7 +1318,7 @@ function fCreateScript_ShowPotentiallyHarmfulCommands(){
 	echo    ""                                                                    >> "${tmpScript_ShowPotentiallyHarmfulCommands}"
 	echo    "cd \"${workingDir_BaseLevel2}\""                                     >> "${tmpScript_ShowPotentiallyHarmfulCommands}"
 	echo -n "cat \"${filespec_Script_rmlint_pass2}\""                             >> "${tmpScript_ShowPotentiallyHarmfulCommands}"
-	echo -n     "| grep -iE \"/mnt/btrfs/array-f7\" "                             >> "${tmpScript_ShowPotentiallyHarmfulCommands}"
+	echo -n     "| grep -iE \"/mnt/bfs/bf7\" "                             >> "${tmpScript_ShowPotentiallyHarmfulCommands}"
 	echo -n     "| grep -iEv \"clone |original_cmd |skip_reflink |rmlint \" "     >> "${tmpScript_ShowPotentiallyHarmfulCommands}"
 	echo        "| less"                                                          >> "${tmpScript_ShowPotentiallyHarmfulCommands}"
 
@@ -1433,10 +1449,14 @@ function fMustBeInPath(){
 }
 
 
-##	Echo-related stuff.
+##
+##	Boilerplate CLI echo-related stuff.
 ##	History
 ##		- 20190826 JC: Created by copying from 0_library_v2.
+##
+
 declare vmbLastEchoWasBlank="false"
+
 function fEcho_Clean(){
 	if [ -n "$1" ]; then
 		local -i vliColumns=$(tput cols)
@@ -1449,13 +1469,18 @@ function fEcho_Clean(){
 		vmbLastEchoWasBlank="true"
 	fi
 }
-function fEcho_ResetBlankCounter(){ vmbLastEchoWasBlank="false"; }
-function fEcho(){ if [ -n "$1" ]; then fEcho_Clean "[ $@ ]"; else fEcho_Clean ""; fi; }
-function fEcho_Force(){ fEcho_ResetBlankCounter; fEcho "$@"; }
 
-##	Errorhandling.
-##	History
+function fEcho_ResetBlankCounter() { vmbLastEchoWasBlank="false"; }
+function fEcho()                   { if [ -n "$1" ]; then fEcho_Clean "[ $@ ]"; else fEcho_Clean ""; fi; }
+function fEcho_Force()             { fEcho_ResetBlankCounter; fEcho "$@"; }
+
+
+##
+##	Boilerplate error-handling.
+##	History:
 ##		- 20190826 JC: Created by copying from 0_library_v2.
+##
+
 function fThrowError(){
 	##	History
 	##		- 20190826 JC: Created
@@ -1465,24 +1490,27 @@ function fThrowError(){
 	fEcho_Clean "${errMsg}"
 	exit 1
 }
+
 function _fTrap_Exit(){
 	if [ "${wasCleanupRun}" == "0" ]; then  ## String compare is less to fail than integer
 		wasCleanupRun=1
 		_fSingleExitPoint "$@"
 	fi
 }
+
 function _fTrap_Error(){
 	if [ "${wasCleanupRun}" == "0" ]; then  ## String compare is less to fail than integer
 		wasCleanupRun=1
 		_fSingleExitPoint "$@"
 	fi
 } 
+
 function _fSingleExitPoint(){
 	##	History
 	##		- 20190828 JC: Created
-	local -r signal="$1"; shift || true
+	local -r signal="$1";  shift || true
 	local -r lineNum="$1"; shift || true
-	local -r errNum="$1"; shift || true
+	local -r errNum="$1";  shift || true
 	local -r errMsg="$@"
 	if [ "${signal}" == "INT" ]; then
 		fEcho_Clean
@@ -1499,9 +1527,17 @@ function _fSingleExitPoint(){
 	## User cleanup
 	fCleanup
 }
-declare -i wasCleanupRun=0
+
+
+##
+##	Main entry point.
+##
+
 set -e
 set -E
+
+declare -i wasCleanupRun=0
+
 trap '_fTrap_Error ERR     ${LINENO} $? $_' ERR
 trap '_fTrap_Error SIGHUP  ${LINENO} $? $_' SIGHUP
 trap '_fTrap_Error SIGINT  ${LINENO} $? $_' SIGINT    ## CTRL+C
@@ -1509,7 +1545,6 @@ trap '_fTrap_Error SIGTERM ${LINENO} $? $_' SIGTERM
 trap '_fTrap_Exit  EXIT    ${LINENO} $? $_' EXIT
 trap '_fTrap_Exit  INT     ${LINENO} $? $_' INT
 trap '_fTrap_Exit  TERM    ${LINENO} $? $_' TERM
-
 
 ## Run fMain
 fMain "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9"
