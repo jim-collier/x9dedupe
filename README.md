@@ -1,4 +1,4 @@
-# x9alldedup<!-- omit in TOC -->
+# x9dedupe<!-- omit in TOC -->
 
 ## Table of contents<!-- omit in TOC -->
 
