@@ -1,5 +1,40 @@
 # x9dedupe<!-- omit in TOC -->
 
+## Important update 
+
+In a hurculean development effort - overcomeingc what everyone said was impossible - OpenZFS >= v2.2.2 now supports native linux `FICLONE` ioctl! (E.g. `cp --reflink`).
+
+That fact makes this tool somewhat moot. (And happily so!)
+
+However, this tool does still help manage `rmlint`s overwhelming feature set, and adds a couple of edge-case features on top.
+
+However: One "shouldn't" blindly run a script downloaded from the internet - no matter how nice everyone says I am. (Or at least most... or some... or a few people.) 
+
+The effort to do such a review in this case, considering the smaller payoff now that OpenZFS natively supports `FICLONE`, is arguably no longer worth it. 
+
+So now I would suggest just installing `rmlint`, then running it directly with these command-line arguments. (Note that the output file specifications can't have spaces in the names for some curious reason):
+
+~~~
+## Define variables on the command line. You can manually add more paths to the end of the actual rmlint command,
+##   but they should all be on the same btrfs subvolume, zfs filesystem, etc. - to take advantage of reflink deduping.
+filePrefix="${HOME}/Documents/rmlint/rmlint_$(date "+%Y%m%d-%H%M%S")
+folderToDedup="/mnt/btrfs/array1" 
+
+## Make the log output directory
+[[ ! -d "$(dirname "${filePrefix}")" ]] && mkdir -p "$(dirname "${filePrefix}")"
+
+## Find and log duplicates
+##    This should work on any filesystem not just Btrfs/ZFS/XFS - at least if you remove this part from the command:
+##    '-o sh:${filePrefix}.sh  --config=sh:handler=clone,reflink')
+rmlint  "${folderToDedup}"  --types=none,duplicates  -o csv:~/${filePrefix}.csv  -o json:${filePrefix}.json    --xattr --no-crossdev --see-symlinks --hidden --size 4k  -v -o summary --no-with-color
+
+## Safely deduplicate using `FICLONE` ioctl (similar to `cp --reflink`).
+##    This step won't rescan, but still couldn't 'dedupe' files with `FICLONE` that it thinks are dupes, but have changed in between runs.
+${filePrefix}.sh  ## Perform the actual dedupe. 
+~~~
+
+But if you're still interested, here you go. This is old now but still generally works.
+
 ## Table of contents<!-- omit in TOC -->
 
 - [Overview](#overview)
