@@ -250,7 +250,7 @@ function fMain(){
 	local -r filespec_Json="${workingFilespec_Base}_scan-results.json"
 	local -r filespec_Script_rmlint_pass2="${workingFilespec_Base}_do-dedupe.sh"
 	local -r filespec_Script_rmlint_pass2_sub_recopy="${workingFilespec_Base}_do-dedup_custom-subroutine.sh"
-	local -r verRmlint="$(rmlint --version 2>&1 | grep -iE "version" | grep -iEo "[0-9]\.[0-9]\.[0-9]" || true)"
+	local -r verRmlint="$(rmlint --version 2>&1 | grep -iE "version" | grep -iEo "[0-9]+\.[0-9]+\.[0-9]+" || true)"
 	local -r output_desc_Pass1="find duplicate files while also calculating and writing hashes to xattrs for new or changed files"
 	local -r output_desc_Pass2="dedupe with Btrfs clone ioctrl"
 	local -r output_BuildInstructions="See script comments for build instructions"
