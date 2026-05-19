@@ -1,36 +1,61 @@
+<!-- markdownlint-disable MD007 -- Unordered list indentation -->
+<!-- markdownlint-disable MD010 -- No hard tabs -->
+<!-- markdownlint-disable MD033 -- No inline html -->
+<!-- markdownlint-disable MD055 -- Table pipe style [Expected: leading_and_trailing; Actual: leading_only; Missing trailing pipe] -->
+<!-- markdownlint-disable MD041 -- First line in a file should be a top-level heading -->
+
 # x9dedupe<!-- omit in TOC -->
 
-## Important update 
+## Important update
 
-In a hurculean development effort - overcomeingc what everyone said was impossible - OpenZFS >= v2.2.2 now supports native linux `FICLONE` ioctl! (E.g. `cp --reflink`).
+The OpenZFS team overcame what everyone said for years was technically impossible: ZFS >= v2.2.2 now supports the native linux `FICLONE` ioctl! (E.g. `cp --reflink`).
 
-That fact makes this tool somewhat moot. (And happily so!)
+That fact makes this tool somewhat moot. (And happily so.)
 
-However, this tool does still help manage `rmlint`s overwhelming feature set, and adds a couple of edge-case features on top.
+The only benefit this tool offers now, is mostly just taming `rmlint`s overwhelming feature set, most of which is irrelevant to CoW deduplication. But that's arguably not a good enough reason to just blindly run random scripts off the internet.
 
-However: One "shouldn't" blindly run a script downloaded from the internet - no matter how nice everyone says I am. (Or at least most... or some... or a few people.) 
+So for now, I would suggest just installing `rmlint`, then running it directly with these reasonably simple command-line arguments:
 
-The effort to do such a review in this case, considering the smaller payoff now that OpenZFS natively supports `FICLONE`, is arguably no longer worth it. 
+~~~bash
+## Create a variable for rmlint output, path and filename prefix.
+## Note that rmlint does not allow these names to have spaces for some reason.
+## Rmlint will create these, this is just to make naming them easier:
+##   ${rmlint_OutputPrefix}.csv   # CSV list of duplicates
+##   ${rmlint_OutputPrefix}.json  # JSON list of duplicates
+##   ${rmlint_OutputPrefix}.sh    # Script to run to do the deduping, below
+rmlint_OutputPrefix="${HOME}/Documents/rmlint/rmlint_$(date "+%Y%m%d-%H%M%S")"
 
-So now I would suggest just installing `rmlint`, then running it directly with these command-line arguments. (Note that the output file specifications can't have spaces in the names for some curious reason):
+## Create a variable for the folder to dedup. You can also just manually add
+##   multiple folders to the command-line, but note that they won't properly
+##   CoW dedupe, unless all are on the same ZFS filesystem or Btrfs subvolume.
+folderToDedup="/mnt/btrfs/array1"
 
-~~~
-## Define variables on the command line. You can manually add more paths to the end of the actual rmlint command,
-##   but they should all be on the same btrfs subvolume, zfs filesystem, etc. - to take advantage of reflink deduping.
-filePrefix="${HOME}/Documents/rmlint/rmlint_$(date "+%Y%m%d-%H%M%S")
-folderToDedup="/mnt/btrfs/array1" 
+## Create the log output directory, if it doesn't exist
+[[ -d "$(dirname "${rmlint_OutputPrefix}")" ]]  ||  mkdir -p "$(dirname "${rmlint_OutputPrefix}")"
 
-## Make the log output directory
-[[ ! -d "$(dirname "${filePrefix}")" ]] && mkdir -p "$(dirname "${filePrefix}")"
+## Use rmlint to find and log duplicates, and create the dedupe script.
+## This step is non-destructive. This step will create the script for the
+##   following step. Note that you could add `-r` (and sudo) to deduplicate
+##   read-only Btrfs snapshots, but that's untested by author. Stick to:
+## Although non-destructive, this scanning step can take quite a while, esp.
+##   the first time if you have terabytes of duplicate data.
+rmlint "${folderToDedup}" --dedupe \
+	--types=none,duplicates \
+	-o sh:${filePrefix}.sh \
+	-o csv:~/${rmlint_OutputPrefix}.csv \
+	-o json:${rmlint_OutputPrefix}.json \
+	--xattr --no-crossdev --see-symlinks --hidden \
+	--size 4k -o summary --no-with-color -v
 
-## Find and log duplicates
-##    This should work on any filesystem not just Btrfs/ZFS/XFS - at least if you remove this part from the command:
-##    '-o sh:${filePrefix}.sh  --config=sh:handler=clone,reflink')
-rmlint  "${folderToDedup}"  --types=none,duplicates  -o csv:~/${filePrefix}.csv  -o json:${filePrefix}.json    --xattr --no-crossdev --see-symlinks --hidden --size 4k  -v -o summary --no-with-color
-
-## Safely deduplicate using `FICLONE` ioctl (similar to `cp --reflink`).
-##    This step won't rescan, but still couldn't 'dedupe' files with `FICLONE` that it thinks are dupes, but have changed in between runs.
-${filePrefix}.sh  ## Perform the actual dedupe. 
+## Perform the actual dedupe, using the script created by the previous step.
+## Safely deduplicates using `FICLONE` ioctl (the same one `cp --reflink` uses.)
+## Deduplicated files can later diverge safely from each other, if either
+##   is edited.
+## For files that change between the previous scan step and this step,
+##   they just won't be deduped. No data loss.
+## This stage is typically much faster than the previous scan step, but can
+##   still take time on the first run of terabytes of data.
+${rmlint_OutputPrefix}.sh
 ~~~
 
 But if you're still interested, here you go. This is old now but still generally works.
