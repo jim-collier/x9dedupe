@@ -19,7 +19,7 @@ So for now, I would suggest just installing `rmlint`, then running it directly w
 ~~~bash
 ## Create a variable for rmlint output, path and filename prefix.
 ## Note that rmlint does not allow these names to have spaces for some reason.
-## Rmlint will create these, this is just to make naming them easier:
+## Rmlint will create these files, this is just to the command easier to read:
 ##   ${rmlint_OutputPrefix}.csv   # CSV list of duplicates
 ##   ${rmlint_OutputPrefix}.json  # JSON list of duplicates
 ##   ${rmlint_OutputPrefix}.sh    # Script to run to do the deduping, below
@@ -35,14 +35,18 @@ folderToDedup="/mnt/btrfs/array1"
 
 ## Use rmlint to find and log duplicates, and create the dedupe script.
 ## This step is non-destructive. This step will create the script for the
-##   following step. Note that you could add `-r` (and sudo) to deduplicate
-##   read-only Btrfs snapshots, but that's untested by author. Stick to:
-## Although non-destructive, this scanning step can take quite a while, esp.
-##   the first time if you have terabytes of duplicate data.
-rmlint "${folderToDedup}" --dedupe \
+##   following step.
+## Although non-destructive, this scanning step can take quite a long time,
+##   esp. the first time if you have terabytes of duplicate data.
+##   Hashes and mtimes are saved in xattrs, so subsequent runs are faster,
+##   and reruns after interruption doesn't lose much progress.
+## Note that you could add `-r` (and sudo) to deduplicate
+##   read-only Btrfs snapshots, but that's untested by author:
+rmlint "${folderToDedup}" \
+	--dedupe \
 	--types=none,duplicates \
-	-o sh:${filePrefix}.sh \
-	-o csv:~/${rmlint_OutputPrefix}.csv \
+	-o sh:${rmlint_OutputPrefix}.sh \
+	-o csv:${rmlint_OutputPrefix}.csv \
 	-o json:${rmlint_OutputPrefix}.json \
 	--xattr --no-crossdev --see-symlinks --hidden \
 	--size 4k -o summary --no-with-color -v
@@ -54,7 +58,7 @@ rmlint "${folderToDedup}" --dedupe \
 ## For files that change between the previous scan step and this step,
 ##   they just won't be deduped. No data loss.
 ## This stage is typically much faster than the previous scan step, but can
-##   still take time on the first run of terabytes of data.
+##   still take time on the first run of terabytes of duplicate data.
 ${rmlint_OutputPrefix}.sh
 ~~~
 
